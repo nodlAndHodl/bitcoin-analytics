@@ -1,0 +1,30 @@
+services:
+  db:
+    image: postgres:latest
+    environment:
+      POSTGRES_USER: bitcoin
+      POSTGRES_PASSWORD: bitcoin
+      POSTGRES_DB: bitcoin
+    ports:
+      - "5432:5432"
+    volumes:
+      - db_data:/var/lib/postgresql/data
+  # app:
+    build: .
+    depends_on:
+      - db
+    environment:
+      DB_HOST: db
+      DB_PORT: 5432
+      DB_USER: bitcoin
+      DB_PASSWORD: bitcoin
+      DB_NAME: bitcoin
+      BTC_RPC_HOST: your-node-host
+      BTC_RPC_PORT: 8332
+      BTC_RPC_USER: yourrpcuser
+      BTC_RPC_PASS: yourrpcpassword
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+volumes:
+  db_data:
