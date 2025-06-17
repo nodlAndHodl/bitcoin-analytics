@@ -3,7 +3,7 @@ package bitstamp
 import (
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"time"
 )
@@ -51,7 +51,10 @@ func (c *Client) GetOHLC(pair string, start, step int64) (*OHLCResponse, error) 
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := ioutil.ReadAll(resp.Body)
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return nil, fmt.Errorf("Bitstamp API request failed with status %d (and could not read response body)", resp.StatusCode)
+		}
 		return nil, fmt.Errorf("Bitstamp API request failed with status %d: %s", resp.StatusCode, string(body))
 	}
 
