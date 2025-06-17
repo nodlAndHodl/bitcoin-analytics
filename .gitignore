@@ -4,3 +4,4 @@ db_data/
 *.out
 *.log
 *.db
+.env

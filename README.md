@@ -10,17 +10,35 @@ A Go web API to aggregate and store Bitcoin address amounts per block, using Pos
 
 ## Getting Started
 
-1. Clone the repo.
-2. Set your Bitcoin Core RPC credentials in `docker-compose.yml` or as environment variables.
-3. Run:
-   ```
-   docker-compose up --build
-   ```
-4. The API will be available at [http://localhost:8080/health](http://localhost:8080/health)
+### Prerequisites
+- Go (1.18+)
+- Docker and Docker Compose
+- A running Bitcoin Core node (local or remote)
 
-## Environment Variables
-- `DB_HOST`, `DB_PORT`, `DB_USER`, `DB_PASSWORD`, `DB_NAME`
-- `BTC_RPC_HOST`, `BTC_RPC_PORT`, `BTC_RPC_USER`, `BTC_RPC_PASS`
+### Configuration
+
+1.  **Set up environment variables**:
+    This project uses a `.env` file for configuration. Start by copying the example file:
+    ```bash
+    cp .env.example .env
+    ```
+
+2.  **Edit the `.env` file**:
+    Open the newly created `.env` file and fill in the details for your Bitcoin Core RPC and PostgreSQL database connections.
+
+### Running the Application
+
+1.  **With Docker (Recommended)**:
+    ```bash
+    docker-compose up --build
+    ```
+
+2.  **Locally**:
+    ```bash
+    go run ./cmd/main.go
+    ```
+
+The API will be available at [http://localhost:8080/health](http://localhost:8080/health).
 
 ## Next Steps
 - Add endpoints for address aggregation and block scanning.
