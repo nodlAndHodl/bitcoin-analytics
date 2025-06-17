@@ -70,7 +70,7 @@ func handleGetAddressUTXOs(btcClient *rpcclient.Client) gin.HandlerFunc {
 		}
 
 		log.Printf("Getting UTXOs for address: %s", address)
-		
+
 		// Use the bitcoinrpc package's GetAddressUTXOs function
 		utxos, err := bitcoinrpc.GetAddressUTXOs(btcClient, address)
 		if err != nil {
@@ -159,7 +159,7 @@ func SetupRouter(btcClient *rpcclient.Client, cfg Config) *gin.Engine {
 	})
 
 	r.GET("/fee-estimate", func(c *gin.Context) {
-		targets := []int64{1, 2, 3}
+		targets := []int64{1, 2, 3, 4, 5}
 		estimates := make([]gin.H, 0, len(targets))
 		for _, blocks := range targets {
 			fee, err := btcClient.EstimateSmartFee(blocks, nil)

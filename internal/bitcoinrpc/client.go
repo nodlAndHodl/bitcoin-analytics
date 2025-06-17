@@ -28,6 +28,12 @@ func Connect() (*rpcclient.Client, error) {
 
 	// Force disable TLS for now to fix the HTTPS error
 	disableTLS := true
+	if os.Getenv("BTC_RPC_DISABLE_TLS") == "true" {
+		disableTLS = true
+	}
+	if os.Getenv("BTC_RPC_DISABLE_TLS") == "false" {
+		disableTLS = false
+	}
 
 	// Log connection details for debugging
 	fmt.Printf("DEBUG: Connecting to Bitcoin RPC at %s (TLS disabled: %v)\n", fullHost, disableTLS)
