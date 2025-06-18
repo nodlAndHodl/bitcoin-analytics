@@ -9,7 +9,6 @@ import (
 )
 
 // Block represents a Bitcoin block
-// Block represents a Bitcoin block
 type Block struct {
 	ID                uuid.UUID      `gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
 	Height            int64          `gorm:"uniqueIndex;not null"`
@@ -35,21 +34,20 @@ type Block struct {
 
 // Transaction represents a Bitcoin transaction
 type Transaction struct {
-	ID            uuid.UUID      `gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
-	BlockID       uuid.UUID      `gorm:"type:uuid;not null;index"`
-	BlockHeight   int64          `gorm:"not null;index"`
-	Hex           string         `gorm:"not null"`
-	Txid          string         `gorm:"uniqueIndex;not null"`
-	Hash          string         `gorm:"not null"`
-	Size          int            `gorm:"not null"`
-	Vsize         int            `gorm:"not null"`
-	Weight        int            `gorm:"not null"`
-	Version       int32          `gorm:"not null"`
-	Locktime      uint32         `gorm:"not null"`
-	Vin           datatypes.JSON `gorm:"type:jsonb"`
-	Vout          datatypes.JSON `gorm:"type:jsonb"`
-	BlockTime     time.Time      `gorm:"not null;index"`
-	CreatedAt     time.Time      `gorm:"not null"`
+	ID          uuid.UUID      `gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
+	BlockHeight int64          `gorm:"not null;index"`
+	Hex         string         `gorm:"not null"`
+	Txid        string         `gorm:"uniqueIndex;not null"`
+	Hash        string         `gorm:"not null"`
+	Size        int            `gorm:"not null"`
+	Vsize       int            `gorm:"not null"`
+	Weight      int            `gorm:"not null"`
+	Version     int32          `gorm:"not null"`
+	Locktime    uint32         `gorm:"not null"`
+	Vin         datatypes.JSON `gorm:"type:jsonb"`
+	Vout        datatypes.JSON `gorm:"type:jsonb"`
+	BlockTime   time.Time      `gorm:"not null;index"`
+	CreatedAt   time.Time      `gorm:"not null"`
 }
 
 // Address represents a Bitcoin address and its balance
@@ -73,61 +71,47 @@ type AddressTransaction struct {
 	CreatedAt   time.Time `gorm:"not null"`
 }
 
-// AddressAmount represents cumulative amount by address and block height
-// (kept for historical analytics)
-type AddressAmount struct {
-    ID          uint      `gorm:"primaryKey"`
-    Address     string    `gorm:"index;not null"`
-    Amount      float64   `gorm:"not null"`
-    BlockHeight int       `gorm:"index;not null"`
-    BlockTime   time.Time `gorm:"not null"`
-    TxID        string    `gorm:"not null"`
-    VoutIndex   int       `gorm:"not null"`
-    CreatedAt   time.Time
-}
-
 // PricePoint represents OHLC price data
 // Stored per hour (or other timeframe) to enable market analytics
 // Unique by timestamp + currency
 type PricePoint struct {
-    ID        uuid.UUID `gorm:"type:uuid;primary_key;"`
-    CreatedAt time.Time
-    UpdatedAt time.Time
-    DeletedAt gorm.DeletedAt `gorm:"index"`
-    Timestamp time.Time      `gorm:"uniqueIndex:idx_timestamp_currency;index"`
-    Currency  string         `gorm:"uniqueIndex:idx_timestamp_currency"`
-    Open      float64
-    High      float64
-    Low       float64
-    Close     float64
+	ID        uuid.UUID `gorm:"type:uuid;primary_key;"`
+	CreatedAt time.Time
+	UpdatedAt time.Time
+	DeletedAt gorm.DeletedAt `gorm:"index"`
+	Timestamp time.Time      `gorm:"uniqueIndex:idx_timestamp_currency;index"`
+	Currency  string         `gorm:"uniqueIndex:idx_timestamp_currency"`
+	Open      float64
+	High      float64
+	Low       float64
+	Close     float64
 }
 
 // BeforeCreate sets UUIDs for PricePoint
 func (p *PricePoint) BeforeCreate(tx *gorm.DB) (err error) {
-    p.ID = uuid.New()
-    return
+	p.ID = uuid.New()
+	return
 }
 
 // UTXO represents an unspent transaction output
 type UTXO struct {
-    ID        uuid.UUID `gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
-    TxID      string    `gorm:"not null;index:idx_utxo_ref"`
-    VoutIndex uint32    `gorm:"not null;index:idx_utxo_ref"`
-    Address   string    `gorm:"not null;index"`
-    Amount    int64     `gorm:"not null"` // in satoshis
-    CreatedAt time.Time `gorm:"not null"`
+	ID        uuid.UUID `gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
+	TxID      string    `gorm:"not null;index:idx_utxo_ref"`
+	VoutIndex uint32    `gorm:"not null;index:idx_utxo_ref"`
+	Address   string    `gorm:"not null;index"`
+	Amount    int64     `gorm:"not null"` // in satoshis
+	CreatedAt time.Time `gorm:"not null"`
 }
 
 // MigrateModels runs database migrations
 func MigrateModels(db *gorm.DB) error {
 	models := []interface{}{
-		&AddressAmount{},
 		&PricePoint{},
 		&Block{},
 		&Transaction{},
 		&Address{},
 		&AddressTransaction{},
-        &UTXO{},
+		&UTXO{},
 	}
 
 	// Enable UUID extension if not exists
