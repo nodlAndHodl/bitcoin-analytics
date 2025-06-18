@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -9,11 +10,13 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/joho/godotenv"
+		"github.com/joho/godotenv"
+
 	"github.com/nodlAndHodl/bitcoin-analytics/internal/api"
 	"github.com/nodlAndHodl/bitcoin-analytics/internal/bitcoinrpc"
-	"github.com/nodlAndHodl/bitcoin-analytics/internal/marketdata"
+	"github.com/nodlAndHodl/bitcoin-analytics/internal/blockimporter"
 	"github.com/nodlAndHodl/bitcoin-analytics/internal/db"
+	"github.com/nodlAndHodl/bitcoin-analytics/internal/marketdata"
 )
 
 func main() {
@@ -55,6 +58,17 @@ func main() {
 	}
 	defer btcClient.Shutdown()
 
+	// Initialize block importer
+	blockImporter := blockimporter.NewBlockImporter(dbConn, btcClient)
+	
+	// Start block import in a separate goroutine
+	go func() {
+		if err := blockImporter.Start(); err != nil {
+			log.Printf("Error starting block importer: %v", err)
+		}
+	}()
+	defer blockImporter.Stop()
+
 	// Start price data worker
 	log.Println("Starting price data worker...")
 	priceWorker := marketdata.NewWorker(
@@ -65,9 +79,12 @@ func main() {
 	// Run the worker in a goroutine
 	go priceWorker.Start()
 
-	// Setup and start API server
-	log.Println("Starting API server...")
-	r := api.SetupRouter(btcClient, api.Config{})
+	// Initialize API router using helper
+	router := api.SetupRouter(btcClient, api.Config{})
+
+	// Register explorer routes
+	explorerHandler := api.NewExplorerHandler(dbConn)
+	explorerHandler.RegisterRoutes(router)
 
 	port := os.Getenv("PORT")
 	if port == "" {
@@ -76,13 +93,14 @@ func main() {
 
 	// Start server in a goroutine
 	server := &http.Server{
-		Addr:    ":" + port,
-		Handler: r,
+		Addr:    fmt.Sprintf(":%s", port),
+		Handler: router,
 	}
 
 	go func() {
+		log.Printf("Server starting on port %s", port)
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("failed to run server: %v", err)
+			log.Fatalf("Failed to start server: %v", err)
 		}
 	}()
 

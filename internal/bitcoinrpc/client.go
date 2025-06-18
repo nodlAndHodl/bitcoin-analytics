@@ -91,7 +91,7 @@ type ScanTxOutSetResult struct {
 	Success   bool   `json:"success"`
 	TxOuts    int    `json:"txouts"`
 	Height    int64  `json:"height"`
-	BestBlock string `json:estblock"`
+	BestBlock string `json:"bestblock"`
 	UTXOs     []struct {
 		TxID         string  `json:"txid"`
 		Vout         uint32  `json:"vout"`
