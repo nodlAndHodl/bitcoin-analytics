@@ -8,6 +8,24 @@ import (
 	"gorm.io/gorm"
 )
 
+// Peer represents a discovered Bitcoin peer
+// ID is the primary key, Address is stored as ip:port and has a unique index.
+// FirstSeen is set only on insert; UpdatedAt is updated on each crawl.
+type Peer struct {
+    ID              uuid.UUID `gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
+    Address         string    `gorm:"uniqueIndex;not null"`
+    Network         string    `gorm:"not null;default:'clearnet';index"`
+    Services        int64     `gorm:"not null"`
+    LastSeen        time.Time `gorm:"not null"`
+    UserAgent       string
+    ProtocolVersion int       `gorm:"not null"`
+    StartHeight     int       `gorm:"not null"`
+    FailedAttempts  int       `gorm:"not null;default:0"`
+    LastFailure     *time.Time `gorm:"index"` // Pointer to allow NULL, add index for querying
+    FirstSeen       time.Time `gorm:"not null;default:CURRENT_TIMESTAMP"`
+    UpdatedAt       time.Time `gorm:"not null"`
+}
+
 // Block represents a Bitcoin block
 type Block struct {
 	ID                uuid.UUID      `gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
@@ -103,6 +121,7 @@ type UTXO struct {
 	CreatedAt time.Time `gorm:"not null"`
 }
 
+
 // MigrateModels runs database migrations
 func MigrateModels(db *gorm.DB) error {
 	models := []interface{}{
@@ -111,6 +130,7 @@ func MigrateModels(db *gorm.DB) error {
 		&Transaction{},
 		&Address{},
 		&AddressTransaction{},
+		&Peer{},
 		&UTXO{},
 	}
 
