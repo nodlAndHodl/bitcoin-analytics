@@ -1,18 +1,18 @@
 package blockimporter
 
 import (
-	"encoding/json"
 	"encoding/hex"
-	"github.com/btcsuite/btcd/txscript"
-	"github.com/btcsuite/btcd/chaincfg"
+	"encoding/json"
 	"fmt"
 	"log"
 	"time"
 
+	"github.com/btcsuite/btcd/chaincfg"
+	"github.com/btcsuite/btcd/txscript"
+
 	"github.com/btcsuite/btcd/btcjson"
-	
+
 	"github.com/btcsuite/btcd/rpcclient"
-	"github.com/google/uuid"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 
@@ -33,7 +33,12 @@ func NewBlockImporter(db *gorm.DB, rpc *rpcclient.Client) *BlockImporter {
 	}
 }
 
-// Start begins the block import process
+const pollInterval = 5 * time.Minute // how often to check for new blocks after initial sync
+
+// Start begins the block import process. It performs an initial one-off catch-up to the
+// node tip. After that completes it polls the node tip every `pollInterval` and imports
+// any new blocks that have arrived. The call is blocking while the initial sync runs –
+// run it in a goroutine if you do not want to block.
 func (bi *BlockImporter) Start() error {
 	// Get the current block height from the node
 	nodeHeight, err := bi.RPC.GetBlockCount()
@@ -48,17 +53,42 @@ func (bi *BlockImporter) Start() error {
 		return fmt.Errorf("failed to get current height: %v", result.Error)
 	}
 
-	// Start importing from the next block
+	// Start importing from the next block (if we are behind)
 	startHeight := currentHeight + 1
-	if startHeight > nodeHeight {
-		log.Printf("Already at the latest block height: %d", currentHeight)
-		return nil
+	if startHeight <= nodeHeight {
+		log.Printf("Starting block import from height %d to %d", startHeight, nodeHeight)
+		bi.importBlocks(startHeight, nodeHeight) // blocking until catch-up complete
+	} else {
+		log.Printf("already at latest block height: %d", currentHeight)
 	}
 
-	log.Printf("Starting block import from height %d to %d", startHeight, nodeHeight)
+	// Begin periodic polling for new blocks once the initial catch-up is finished
+	log.Printf("entering polling mode – will check for new blocks every %s", pollInterval)
+	ticker := time.NewTicker(pollInterval)
+	go func() {
+		defer ticker.Stop()
+		for {
+			select {
+			case <-bi.shutdown:
+				return
+			case <-ticker.C:
+				// Determine current db tip
+				var dbTip int64
+				_ = bi.DB.Model(&db.Block{}).Select("COALESCE(MAX(height), -1)").Scan(&dbTip)
 
-	// Start the import process in a goroutine
-	go bi.importBlocks(startHeight, nodeHeight)
+				nodeTip, err := bi.RPC.GetBlockCount()
+				if err != nil {
+					log.Printf("failed to get block count: %v", err)
+					continue
+				}
+
+				if nodeTip > dbTip {
+					log.Printf("detected new blocks – importing %d to %d", dbTip+1, nodeTip)
+					bi.importBlocks(dbTip+1, nodeTip)
+				}
+			}
+		}
+	}()
 
 	return nil
 }
@@ -81,7 +111,7 @@ func (bi *BlockImporter) importBlocks(startHeight, endHeight int64) {
 				continue
 			}
 
-					// Get block with verbose transaction data
+			// Get block with verbose transaction data
 			block, err := bi.RPC.GetBlockVerboseTx(hash)
 			if err != nil {
 				log.Printf("Error getting block at height %d: %v", height, err)
@@ -106,8 +136,6 @@ func (bi *BlockImporter) processBlock(block *btcjson.GetBlockVerboseTxResult) er
 	if dbTx.Error != nil {
 		return fmt.Errorf("failed to begin db transaction: %v", dbTx.Error)
 	}
-	// Directly use DB without opening extra transaction
-	
 
 	// Convert block time to time.Time
 	blockTime := time.Unix(block.Time, 0)
@@ -167,7 +195,6 @@ func (bi *BlockImporter) processBlock(block *btcjson.GetBlockVerboseTxResult) er
 func (bi *BlockImporter) processTransaction(dbTx *gorm.DB, txData btcjson.TxRawResult, blockHeight int64, blockTime time.Time) error {
 	// Create transaction record
 	txRecord := &db.Transaction{
-		BlockID:     uuid.Nil, // Will be set by the database
 		BlockHeight: blockHeight,
 		Hex:         txData.Hex,
 		Txid:        txData.Txid,

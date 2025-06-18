@@ -10,7 +10,7 @@ import (
 	"syscall"
 	"time"
 
-		"github.com/joho/godotenv"
+	"github.com/joho/godotenv"
 
 	"github.com/nodlAndHodl/bitcoin-analytics/internal/api"
 	"github.com/nodlAndHodl/bitcoin-analytics/internal/bitcoinrpc"
@@ -60,7 +60,7 @@ func main() {
 
 	// Initialize block importer
 	blockImporter := blockimporter.NewBlockImporter(dbConn, btcClient)
-	
+
 	// Start block import in a separate goroutine
 	go func() {
 		if err := blockImporter.Start(); err != nil {
@@ -71,9 +71,8 @@ func main() {
 
 	// Start price data worker
 	log.Println("Starting price data worker...")
-	priceWorker := marketdata.NewWorker(
+	priceWorker := marketdata.PriceWorker(
 		dbConn,
-		"btcusd", // Bitstamp currency pair
 	)
 
 	// Run the worker in a goroutine

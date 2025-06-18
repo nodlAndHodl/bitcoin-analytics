@@ -38,11 +38,11 @@ type Worker struct {
 	initialBackfillDone bool
 }
 
-func NewWorker(db *gorm.DB, currencyPair string) *Worker {
+func PriceWorker(db *gorm.DB) *Worker {
 	return &Worker{
 		db:                  db,
-		client:              bitstamp.NewClient(),
-		currencyPair:        currencyPair,
+		client:              bitstamp.BitstampClient(),
+		currencyPair:        "btcusd",
 		initialBackfillDone: false,
 	}
 }
@@ -130,11 +130,8 @@ func (w *Worker) BackfillHistoricalData() error {
 	return nil
 }
 
+// storeOHLCData stores OHLC data in the database
 func (w *Worker) storeOHLCData(data *bitstamp.OHLCResponse) error {
-	if data == nil || len(data.Data.OHLC) == 0 {
-		return nil
-	}
-
 	pricePoints := make([]db.PricePoint, 0, len(data.Data.OHLC))
 	for _, ohlc := range data.Data.OHLC {
 		ts, err := strconv.ParseInt(ohlc.Time, 10, 64)
