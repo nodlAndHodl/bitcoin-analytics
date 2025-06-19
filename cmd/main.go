@@ -4,9 +4,12 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -17,6 +20,7 @@ import (
 	"github.com/nodlAndHodl/bitcoin-analytics/internal/blockimporter"
 	"github.com/nodlAndHodl/bitcoin-analytics/internal/db"
 	"github.com/nodlAndHodl/bitcoin-analytics/internal/marketdata"
+	"github.com/nodlAndHodl/bitcoin-analytics/internal/peercrawler"
 )
 
 func main() {
@@ -57,6 +61,78 @@ func main() {
 		log.Fatalf("failed to connect to Bitcoin RPC: %v", err)
 	}
 	defer btcClient.Shutdown()
+
+	// Start peer crawler
+	log.Println("Starting peer crawler...")
+
+	peerCrawlerWorkersStr := os.Getenv("PEER_CRAWLER_WORKERS")
+	peerCrawlerWorkers, err := strconv.Atoi(peerCrawlerWorkersStr)
+	if err != nil || peerCrawlerWorkers <= 0 {
+		log.Printf("Invalid or missing PEER_CRAWLER_WORKERS, defaulting to 3. Error: %v", err)
+		peerCrawlerWorkers = 3
+	}
+
+	// DNS seeds and hard-coded reachable nodes
+	dnsSeeds := []string{
+		"seed.bitcoin.sipa.be",
+		"dnsseed.bitcoin.dashjr.org",
+		"seed.bitcoinstats.com",
+		"seed.bitcoin.jonasschnelli.ch",
+	}
+	hardcoded := []string{
+		// Clearnet nodes
+		"47.96.110.251:8333",  // example China
+		"152.89.162.238:8333", // example EU
+		"38.242.220.211:8333", // example US
+
+		// Tor nodes (v3 onion addresses)
+		"ufmzgrvn2uxzclapi2qzbuqq2nmezjnimnvxxuddyojkzz6jvtnnmgid.onion:8333",
+		"i2f3uxhpecs7nf3litesvf7m6bbupgd2ejmtxlsseparw6onmawdx7id.onion:8333",
+		"cc7hh7dc3m4yl2vjui4vy43rspwqr7ss5btesd4kd5tpnopp2mho3ryd.onion:8333", // Bitcoin Core node
+		"bk7yp6epnmcllq72pwb4j4z7ioo3vyfgwm4xcr4ge6n5mnbfd3kfyxad.onion:8333", // Umbrel node
+	}
+	var seedAddrs []string
+	// resolve DNS seeds
+	for _, host := range dnsSeeds {
+		if ips, err := net.LookupHost(host); err == nil {
+			for _, ip := range ips {
+				seedAddrs = append(seedAddrs, net.JoinHostPort(ip, "8333"))
+			}
+		}
+	}
+	seedAddrs = append(seedAddrs, hardcoded...)
+	// remove duplicates
+	seenSeed := make(map[string]struct{})
+	uniqueSeeds := make([]string, 0, len(seedAddrs))
+	for _, a := range seedAddrs {
+		key := strings.ToLower(a)
+		if _, ok := seenSeed[key]; !ok {
+			seenSeed[key] = struct{}{}
+			uniqueSeeds = append(uniqueSeeds, a)
+		}
+	}
+
+	// Combine any unique seeds with default Bitcoin seed nodes
+	defaultSeeds := []string{
+		"seed.bitcoin.sipa.be:8333",
+		"dnsseed.bluematt.me:8333",
+		"dnsseed.bitcoin.dashjr.org:8333",
+		"seed.bitcoinstats.com:8333",
+		"seed.bitcoin.jonasschnelli.ch:8333",
+		"seed.btc.petertodd.org:8333",
+	}
+
+	// Add default seeds to uniqueSeeds
+	for _, seed := range defaultSeeds {
+		key := strings.ToLower(seed)
+		if _, ok := seenSeed[key]; !ok {
+			seenSeed[key] = struct{}{}
+			uniqueSeeds = append(uniqueSeeds, seed)
+		}
+	}
+
+	pc := peercrawler.NewCrawler(dbConn, uniqueSeeds)
+	go pc.Start(ctx)
 
 	// Initialize block importer
 	blockImporter := blockimporter.NewBlockImporter(dbConn, btcClient)
