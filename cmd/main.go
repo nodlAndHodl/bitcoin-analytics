@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"log"
 	"net/http"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/joho/godotenv"
 
+	"github.com/nodlAndHodl/bitcoin-analytics/internal/analytics"
 	"github.com/nodlAndHodl/bitcoin-analytics/internal/api"
 	"github.com/nodlAndHodl/bitcoin-analytics/internal/bitcoinrpc"
 	"github.com/nodlAndHodl/bitcoin-analytics/internal/blockimporter"
@@ -20,6 +22,10 @@ import (
 )
 
 func main() {
+	// Define command-line flags
+	reprocessBlock := flag.Int64("reprocess", 0, "Specify a block height to reprocess. If > 0, the server will not start.")
+	flag.Parse()
+
 	// Load environment variables
 	if err := godotenv.Load(); err != nil {
 		log.Printf("Warning: Error loading .env file: %v", err)
@@ -61,6 +67,16 @@ func main() {
 	// Initialize block importer
 	blockImporter := blockimporter.NewBlockImporter(dbConn, btcClient)
 
+	// Handle reprocessing if the flag is set
+	if *reprocessBlock > 0 {
+		log.Printf("--- Reprocessing Block %d ---", *reprocessBlock)
+		if err := blockImporter.ReprocessBlock(*reprocessBlock); err != nil {
+			log.Fatalf("Failed to reprocess block %d: %v", *reprocessBlock, err)
+		}
+		log.Printf("--- Successfully reprocessed block %d ---", *reprocessBlock)
+		return // Exit after reprocessing is complete
+	}
+
 	// Start block import in a separate goroutine
 	go func() {
 		if err := blockImporter.Start(); err != nil {
@@ -71,12 +87,13 @@ func main() {
 
 	// Start price data worker
 	log.Println("Starting price data worker...")
-	priceWorker := marketdata.PriceWorker(
-		dbConn,
-	)
-
-	// Run the worker in a goroutine
+	priceWorker := marketdata.PriceWorker(dbConn)
 	go priceWorker.Start()
+
+	// Start the analytics service and view refresher
+	analyticsService := analytics.NewService(dbConn)
+	// Refresh views every 6 hours. Adjust the interval as needed.
+	go analyticsService.StartRefresher(6 * time.Hour)
 
 	// Initialize API router using helper
 	router := api.SetupRouter(btcClient, api.Config{})
@@ -84,6 +101,10 @@ func main() {
 	// Register explorer routes
 	explorerHandler := api.NewExplorerHandler(dbConn)
 	explorerHandler.RegisterRoutes(router)
+
+	// Register analytics routes
+	analyticsHandler := api.NewAnalyticsHandler(analyticsService)
+	analyticsHandler.RegisterRoutes(router)
 
 	port := os.Getenv("PORT")
 	if port == "" {

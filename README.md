@@ -43,3 +43,10 @@ The API will be available at [http://localhost:8080/health](http://localhost:808
 ## Next Steps
 - Add endpoints for address aggregation and block scanning.
 - Implement block iteration and database population logic.
+
+
+
+A function to calculate Circulating Supply at a given time/block height.
+A function to calculate Market Value at a given time.
+A function to calculate Realized Value at a given time.
+A function to calculate the MVRV Z-Score itself, using the outputs of the above.

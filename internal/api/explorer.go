@@ -5,9 +5,8 @@ import (
 	"strconv"
 
 	"github.com/gin-gonic/gin"
-		"gorm.io/gorm"
-
 	"github.com/nodlAndHodl/bitcoin-analytics/internal/db"
+	"gorm.io/gorm"
 )
 
 type ExplorerHandler struct {

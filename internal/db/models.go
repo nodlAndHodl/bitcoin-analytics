@@ -125,6 +125,20 @@ func MigrateModels(db *gorm.DB) error {
 		}
 	}
 
+	// Drop existing materialized views and their dependencies in reverse order of creation
+	DropStatements := []string{
+		"DROP MATERIALIZED VIEW IF EXISTS mv_daily_realized_value;",
+		"DROP MATERIALIZED VIEW IF EXISTS mv_daily_circulating_supply;",
+		"DROP VIEW IF EXISTS v_all_inputs;",
+		"DROP VIEW IF EXISTS v_all_outputs;",
+	}
+
+	for _, stmt := range DropStatements {
+		if err := db.Exec(stmt).Error; err != nil {
+			return err
+		}
+	}
+
 	// Create indexes
 	db.Exec(`
 		CREATE INDEX IF NOT EXISTS idx_blocks_time ON blocks(time);
@@ -132,6 +146,129 @@ func MigrateModels(db *gorm.DB) error {
 		CREATE INDEX IF NOT EXISTS idx_address_transactions_address ON address_transactions(address);
 		CREATE INDEX IF NOT EXISTS idx_address_transactions_txid ON address_transactions(tx_id);
 	`)
+
+	// Create SQL function for block subsidy calculation
+	db.Exec(`
+		CREATE OR REPLACE FUNCTION calculate_block_subsidy(block_height BIGINT)
+		RETURNS BIGINT AS $$
+		DECLARE
+		    initial_subsidy BIGINT := 5000000000; -- 50 BTC in satoshis
+		    halvings INT;
+		BEGIN
+		    IF block_height < 0 THEN
+		        RETURN 0;
+		    END IF;
+		    halvings := block_height / 210000;
+		    IF halvings >= 64 THEN -- Max halvings before subsidy becomes 0
+		        RETURN 0;
+		    END IF;
+		    RETURN initial_subsidy >> halvings; -- Bitwise right shift for halving
+		END;
+		$$ LANGUAGE plpgsql IMMUTABLE;
+	`)
+
+	// Create helper views
+	db.Exec(`
+		CREATE OR REPLACE VIEW v_all_outputs AS
+		SELECT
+			t.txid,
+			(vout_item ->> 'n')::int AS vout_index,
+			t.block_time AS creation_time,
+			(vout_item -> 'value')::numeric AS value_btc,
+			(SELECT p.close FROM price_points p WHERE p.timestamp <= t.block_time ORDER BY p.timestamp DESC LIMIT 1) AS price_at_creation
+		FROM
+			transactions t,
+			jsonb_array_elements(t.vout) AS vout_item;
+	`)
+
+	db.Exec(`
+		CREATE OR REPLACE VIEW v_all_inputs AS
+		SELECT
+			(vin_item ->> 'txid') AS spent_txid,
+			(vin_item ->> 'vout')::int AS spent_vout_index,
+			t.block_time as spent_time
+		FROM
+			transactions t,
+			jsonb_array_elements(t.vin) as vin_item
+		WHERE
+			jsonb_extract_path_text(vin_item, 'txid') IS NOT NULL;
+	`)
+
+	// Materialized View: Daily Circulating Supply (cumulative total supply and daily transaction fees)
+	db.Exec(`
+		CREATE MATERIALIZED VIEW mv_daily_circulating_supply AS
+		WITH coinbase_transactions_daily AS (
+			-- This CTE calculates the daily new supply and daily fees from coinbase transactions
+			SELECT
+				date_trunc('day', t.block_time AT TIME ZONE 'UTC') AS day,
+				SUM(
+					(SELECT SUM((vout_item->>'value')::numeric * 100000000)::BIGINT FROM jsonb_array_elements(t.vout) AS vout_item)
+				) as daily_new_supply_sats,
+				SUM(
+					GREATEST(0, 
+						(SELECT SUM((vout_item->>'value')::numeric * 100000000)::BIGINT FROM jsonb_array_elements(t.vout) AS vout_item) 
+						-
+						calculate_block_subsidy(t.block_height)
+					)
+				) AS daily_block_transaction_fees_sats
+			FROM
+				transactions t
+			WHERE
+				EXISTS (
+					SELECT 1
+					FROM jsonb_array_elements(t.vin) WITH ORDINALITY AS vin_arr(vin_item, vin_idx)
+					WHERE vin_arr.vin_idx = 1 AND vin_arr.vin_item ? 'coinbase'
+				)
+			GROUP BY
+				date_trunc('day', t.block_time AT TIME ZONE 'UTC')
+		)
+		SELECT
+			day,
+			SUM(daily_new_supply_sats) OVER (ORDER BY day ASC) as circulating_supply_sats, -- Cumulative total supply
+			daily_block_transaction_fees_sats as block_transaction_fees_sats -- Daily fees (not cumulative)
+		FROM
+			coinbase_transactions_daily
+		ORDER BY
+			day;
+
+		CREATE UNIQUE INDEX IF NOT EXISTS idx_mv_daily_circulating_supply_day ON mv_daily_circulating_supply(day);
+	`)
+
+	// Materialized View for Realized Value
+	db.Exec(`
+		CREATE MATERIALIZED VIEW IF NOT EXISTS mv_daily_realized_value AS
+		WITH output_lifecycle AS (
+			SELECT
+				o.creation_time,
+				o.value_btc * o.price_at_creation AS realized_value_contribution,
+				i.spent_time
+			FROM
+				v_all_outputs o
+			LEFT JOIN
+				v_all_inputs i ON o.txid = i.spent_txid AND o.vout_index = i.spent_vout_index
+		),
+		daily_changes AS (
+			SELECT
+				day,
+				SUM(value_added) as total_added,
+				SUM(value_removed) as total_removed
+			FROM (
+				SELECT date_trunc('day', creation_time) as day, realized_value_contribution as value_added, 0 as value_removed FROM output_lifecycle
+				UNION ALL
+				SELECT date_trunc('day', spent_time) as day, 0 as value_added, realized_value_contribution as value_removed FROM output_lifecycle WHERE spent_time IS NOT NULL
+			) AS changes
+			GROUP BY day
+		)
+		SELECT
+			day,
+			SUM(total_added - total_removed) OVER (ORDER BY day ASC) as realized_value
+		FROM
+			daily_changes
+		WHERE day IS NOT NULL
+		ORDER BY
+			day;
+	`)
+	db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_mv_daily_realized_value_day ON mv_daily_realized_value(day);`)
 
 	return nil
 }
