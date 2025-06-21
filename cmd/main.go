@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"flag"
 	"fmt"
 	"log"
 	"net/http"
@@ -23,9 +22,6 @@ import (
 
 func main() {
 	// Define command-line flags
-	reprocessBlock := flag.Int64("reprocess", 0, "Specify a block height to reprocess. If > 0, the server will not start.")
-	flag.Parse()
-
 	// Load environment variables
 	if err := godotenv.Load(); err != nil {
 		log.Printf("Warning: Error loading .env file: %v", err)
@@ -66,16 +62,6 @@ func main() {
 
 	// Initialize block importer
 	blockImporter := blockimporter.NewBlockImporter(dbConn, btcClient)
-
-	// Handle reprocessing if the flag is set
-	if *reprocessBlock > 0 {
-		log.Printf("--- Reprocessing Block %d ---", *reprocessBlock)
-		if err := blockImporter.ReprocessBlock(*reprocessBlock); err != nil {
-			log.Fatalf("Failed to reprocess block %d: %v", *reprocessBlock, err)
-		}
-		log.Printf("--- Successfully reprocessed block %d ---", *reprocessBlock)
-		return // Exit after reprocessing is complete
-	}
 
 	// Start block import in a separate goroutine
 	go func() {

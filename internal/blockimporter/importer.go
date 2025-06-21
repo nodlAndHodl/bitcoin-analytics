@@ -11,7 +11,6 @@ import (
 	"github.com/btcsuite/btcd/txscript"
 
 	"github.com/btcsuite/btcd/btcjson"
-	"github.com/btcsuite/btcd/chaincfg/chainhash"
 
 	"github.com/btcsuite/btcd/rpcclient"
 	"gorm.io/gorm"
@@ -19,15 +18,6 @@ import (
 
 	"github.com/nodlAndHodl/bitcoin-analytics/internal/db"
 )
-
-// MissingUTXOError is a custom error type returned when an input UTXO is not found.
-type MissingUTXOError struct {
-	TxID string // The TxID of the transaction that created the missing UTXO
-}
-
-func (e *MissingUTXOError) Error() string {
-	return fmt.Sprintf("missing UTXO from transaction %s", e.TxID)
-}
 
 type BlockImporter struct {
 	DB       *gorm.DB
@@ -115,89 +105,29 @@ func (bi *BlockImporter) importBlocks(startHeight, endHeight int64) {
 			log.Println("Block import stopped by shutdown signal")
 			return
 		default:
-			if err := bi.importSingleBlock(height); err != nil {
-				log.Printf("Error importing block %d: %v", height, err)
+			hash, err := bi.RPC.GetBlockHash(height)
+			if err != nil {
+				log.Printf("Error getting block hash at height %d: %v", height, err)
+				continue
+			}
+
+			// Get block with verbose transaction data
+			block, err := bi.RPC.GetBlockVerboseTx(hash)
+			if err != nil {
+				log.Printf("Error getting block at height %d: %v", height, err)
+				continue
+			}
+
+			if err := bi.processBlock(block); err != nil {
+				log.Printf("Error processing block %d: %v", height, err)
 				continue
 			}
 
 			if height%1000 == 0 || height == endHeight {
-				log.Printf("Processed block %d/%d (%.2f%%)", height, endHeight, float64(height)/float64(endHeight)*100)
+				log.Printf("Processed block %d/%d (%.2f%%)", height, endHeight, float64(height-startHeight+1)/float64(endHeight-startHeight+1)*100)
 			}
 		}
 	}
-}
-
-// ReprocessBlock atomically deletes all data for a given block height and re-imports it.
-func (bi *BlockImporter) ReprocessBlock(height int64) error {
-	dbTx := bi.DB.Begin()
-	if dbTx.Error != nil {
-		return fmt.Errorf("failed to begin db transaction for reprocessing: %w", dbTx.Error)
-	}
-
-	// Delete all data associated with this block height.
-	if err := dbTx.Where("block_height = ?", height).Delete(&db.AddressTransaction{}).Error; err != nil {
-		dbTx.Rollback()
-		return fmt.Errorf("failed to delete address transactions for block %d: %w", height, err)
-	}
-
-	if err := dbTx.Where("block_height = ?", height).Delete(&db.Transaction{}).Error; err != nil {
-		dbTx.Rollback()
-		return fmt.Errorf("failed to delete transactions for block %d: %w", height, err)
-	}
-
-	if err := dbTx.Where("height = ?", height).Delete(&db.Block{}).Error; err != nil {
-		dbTx.Rollback()
-		return fmt.Errorf("failed to delete block %d: %w", height, err)
-	}
-
-	if err := dbTx.Commit().Error; err != nil {
-		return fmt.Errorf("failed to commit deletions for block %d: %w", height, err)
-	}
-
-	// After deleting, re-import the block.
-	return bi.importSingleBlock(height)
-}
-
-// importSingleBlock fetches and processes a single block by its height.
-// It includes logic to automatically recover from missing UTXO dependencies.
-func (bi *BlockImporter) importSingleBlock(height int64) error {
-	hash, err := bi.RPC.GetBlockHash(height)
-	if err != nil {
-		return fmt.Errorf("error getting block hash at height %d: %w", height, err)
-	}
-
-	block, err := bi.RPC.GetBlockVerboseTx(hash)
-	if err != nil {
-		return fmt.Errorf("error getting block at height %d: %w", height, err)
-	}
-
-	err = bi.processBlock(block)
-	if err != nil {
-		// Check if the error is a missing UTXO dependency
-		if missingUTXOErr, ok := err.(*MissingUTXOError); ok {
-			log.Printf("Dependency error: Missing UTXO from tx %s. Attempting auto-recovery.", missingUTXOErr.TxID)
-
-			// Find the block that needs to be reprocessed
-			sourceBlockHeight, findErr := bi.findBlockHeightForTx(missingUTXOErr.TxID)
-			if findErr != nil {
-				return fmt.Errorf("could not find source block for missing UTXO tx %s: %w", missingUTXOErr.TxID, findErr)
-			}
-
-			log.Printf("Source of missing UTXO is block %d. Reprocessing it now.", sourceBlockHeight)
-			if reprocessErr := bi.ReprocessBlock(sourceBlockHeight); reprocessErr != nil {
-				return fmt.Errorf("failed to reprocess source block %d: %w", sourceBlockHeight, reprocessErr)
-			}
-
-			log.Printf("Successfully reprocessed dependency block %d. Retrying import of block %d.", sourceBlockHeight, height)
-			// Retry processing the original block now that the dependency should be fixed
-			return bi.importSingleBlock(height)
-		}
-
-		// For other errors, just return
-		return fmt.Errorf("error processing block %d: %w", height, err)
-	}
-
-	return nil
 }
 
 func (bi *BlockImporter) processBlock(block *btcjson.GetBlockVerboseTxResult) error {
@@ -262,29 +192,6 @@ func (bi *BlockImporter) processBlock(block *btcjson.GetBlockVerboseTxResult) er
 	return dbTx.Commit().Error
 }
 
-func (bi *BlockImporter) findBlockHeightForTx(txid string) (int64, error) {
-	txHash, err := chainhash.NewHashFromStr(txid)
-	if err != nil {
-		return 0, fmt.Errorf("invalid transaction hash: %w", err)
-	}
-	tx, err := bi.RPC.GetRawTransactionVerbose(txHash)
-	if err != nil {
-		return 0, fmt.Errorf("failed to get transaction: %w", err)
-	}
-	if tx.BlockHash == "" {
-		return 0, fmt.Errorf("transaction is not yet in a block")
-	}
-	blockHash, err := chainhash.NewHashFromStr(tx.BlockHash)
-	if err != nil {
-		return 0, fmt.Errorf("invalid block hash: %w", err)
-	}
-	block, err := bi.RPC.GetBlockVerbose(blockHash)
-	if err != nil {
-		return 0, fmt.Errorf("failed to get block: %w", err)
-	}
-	return block.Height, nil
-}
-
 func (bi *BlockImporter) processTransaction(dbTx *gorm.DB, txData btcjson.TxRawResult, blockHeight int64, blockTime time.Time) error {
 	// Create transaction record
 	txRecord := &db.Transaction{
@@ -328,39 +235,26 @@ func (bi *BlockImporter) processTransaction(dbTx *gorm.DB, txData btcjson.TxRawR
 		// locate the UTXO being spent
 		var utxo db.UTXO
 		err := dbTx.Where("tx_id = ? AND vout_index = ?", vin.Txid, vin.Vout).First(&utxo).Error
-		if err != nil {
-			if err == gorm.ErrRecordNotFound {
-				// This is a critical dependency error. Return a special error type
-				// so the caller can attempt to recover by reprocessing the source block.
-				return &MissingUTXOError{TxID: vin.Txid}
+		if err == nil {
+			// debit balance
+			if err := dbTx.Exec(`
+				UPDATE addresses SET balance = balance - ?, updated_at = NOW() WHERE address = ?`, utxo.Amount, utxo.Address).Error; err != nil {
+				return fmt.Errorf("failed to debit balance: %v", err)
 			}
-			return fmt.Errorf("failed to find utxo: %v", err)
-		}
 
-		// if we found the utxo, process the spend
-		// debit balance
-		if err := dbTx.Exec(`
-			UPDATE addresses SET balance = balance - ?, updated_at = NOW() WHERE address = ?`, utxo.Amount, utxo.Address).Error; err != nil {
-			return fmt.Errorf("failed to debit balance: %v", err)
-		}
+			// outgoing address transaction
+			addrTx := &db.AddressTransaction{
+				Address:     utxo.Address,
+				TxID:        txData.Txid,
+				BlockHeight: blockHeight,
+				Amount:      -utxo.Amount,
+				IsOutgoing:  true,
+				CreatedAt:   time.Now(),
+			}
+			_ = dbTx.Clauses(clause.OnConflict{DoNothing: true}).Create(addrTx).Error
 
-		// outgoing address transaction
-		addrTx := &db.AddressTransaction{
-			Address:     utxo.Address,
-			TxID:        txData.Txid,
-			BlockHeight: blockHeight,
-			Amount:      -utxo.Amount,
-			IsOutgoing:  true,
-			CreatedAt:   time.Now(),
-		}
-		if err := dbTx.Clauses(clause.OnConflict{DoNothing: true}).Create(addrTx).Error; err != nil {
-			// Log error but don't fail the whole block import
-			log.Printf("failed to create address transaction: %v", err)
-		}
-
-		// remove utxo
-		if err := dbTx.Delete(&utxo).Error; err != nil {
-			return fmt.Errorf("failed to delete spent utxo: %v", err)
+			// remove utxo
+			dbTx.Delete(&utxo)
 		}
 	}
 
