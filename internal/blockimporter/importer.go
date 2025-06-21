@@ -1,18 +1,14 @@
 package blockimporter
 
 import (
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
 	"time"
 
-	"github.com/btcsuite/btcd/chaincfg"
-	"github.com/btcsuite/btcd/txscript"
-
-	"github.com/btcsuite/btcd/btcjson"
-
 	"github.com/btcsuite/btcd/rpcclient"
+	"github.com/btcsuite/btcd/btcjson"
+	"github.com/google/uuid"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 
@@ -58,6 +54,17 @@ func (bi *BlockImporter) Start() error {
 	if startHeight <= nodeHeight {
 		log.Printf("Starting block import from height %d to %d", startHeight, nodeHeight)
 		bi.importBlocks(startHeight, nodeHeight) // blocking until catch-up complete
+		
+		// After initial import, process addresses and UTXOs (second pass)
+		// We use max(0, startHeight) because startHeight could be 0 and we need to process from genesis
+		processStartHeight := startHeight
+		if processStartHeight < 0 {
+			processStartHeight = 0
+		}
+		log.Printf("Starting second-pass processing for addresses and UTXOs from height %d to %d", processStartHeight, nodeHeight)
+		if err := bi.ProcessAddressesAndUTXOs(processStartHeight, nodeHeight); err != nil {
+			log.Printf("Error in second-pass processing: %v", err)
+		}
 	} else {
 		log.Printf("already at latest block height: %d", currentHeight)
 	}
@@ -124,19 +131,13 @@ func (bi *BlockImporter) importBlocks(startHeight, endHeight int64) {
 			}
 
 			if height%1000 == 0 || height == endHeight {
-				log.Printf("Processed block %d/%d (%.2f%%)", height, endHeight, float64(height-startHeight+1)/float64(endHeight-startHeight+1)*100)
+				log.Printf("Processed block %d/%d (%.2f%%)", height, endHeight, float64(height)/float64(endHeight)*100)
 			}
 		}
 	}
 }
 
 func (bi *BlockImporter) processBlock(block *btcjson.GetBlockVerboseTxResult) error {
-	// Start a DB transaction for this block and its transactions
-	dbTx := bi.DB.Begin()
-	if dbTx.Error != nil {
-		return fmt.Errorf("failed to begin db transaction: %v", dbTx.Error)
-	}
-
 	// Convert block time to time.Time
 	blockTime := time.Unix(block.Time, 0)
 	// For now, use block time as median time
@@ -175,24 +176,61 @@ func (bi *BlockImporter) processBlock(block *btcjson.GetBlockVerboseTxResult) er
 	}
 	blockRecord.Tx = txJSON
 
-	// Save block to database, ignore duplicates
-	if err := dbTx.Clauses(clause.OnConflict{DoNothing: true}).Create(blockRecord).Error; err != nil {
-		dbTx.Rollback()
-		return fmt.Errorf("failed to save block: %v", err)
+	// Start a DB transaction for this block and its transactions
+	dbTx := bi.DB.Begin()
+	if dbTx.Error != nil {
+		return fmt.Errorf("failed to begin db transaction: %v", dbTx.Error)
 	}
 
-	// Process transactions
-	for _, txData := range block.Tx {
-		if err := bi.processTransaction(dbTx, txData, block.Height, blockTime); err != nil {
+	// Handle any panics and rollback
+	defer func() {
+		if r := recover(); r != nil {
 			dbTx.Rollback()
-			return fmt.Errorf("failed to process transaction %s: %v", txData.Txid, err)
+			log.Printf("recovered from panic in processBlock: %v", r)
+		}
+	}()
+
+	// Insert block
+	if err := dbTx.Clauses(clause.OnConflict{DoNothing: true}).Create(blockRecord).Error; err != nil {
+		dbTx.Rollback()
+		return fmt.Errorf("failed to insert block: %v", err)
+	}
+
+	// Batch collections
+	var addrTxBatch []*db.AddressTransaction
+	var utxoBatch []*db.UTXO
+
+	// Process each transaction in the block
+	// Use the transaction data already provided by GetBlockVerboseTx
+	// This eliminates the need for additional RPC calls
+	for _, txData := range block.Tx {
+		// Process transaction - first pass only stores transaction data
+		err := bi.processTransaction(dbTx, txData, block.Height, &addrTxBatch, &utxoBatch)
+		if err != nil {
+			dbTx.Rollback()
+			return fmt.Errorf("failed to process transaction: %v", err)
 		}
 	}
 
-	return dbTx.Commit().Error
+	// Commit the transaction
+	if err := dbTx.Commit().Error; err != nil {
+		return fmt.Errorf("failed to commit transaction: %v", err)
+	}
+
+	return nil
 }
 
-func (bi *BlockImporter) processTransaction(dbTx *gorm.DB, txData btcjson.TxRawResult, blockHeight int64, blockTime time.Time) error {
+// Constants for batch processing
+const (
+	AddrTxBatchSize  = 1000 // Increased batch size for better performance
+	UTXOBatchSize    = 1000
+	AddressBatchSize = 1000
+	BlockBatchSize   = 100  // Process this many blocks before processing their addresses
+	MaxHeight       = -1   // Used to process all available blocks
+)
+
+// First-pass processing: Store only blocks and transaction data (no addresses or UTXOs)
+func (bi *BlockImporter) processTransaction(dbTx *gorm.DB, txData btcjson.TxRawResult, blockHeight int64, addrTxBatch *[]*db.AddressTransaction, utxoBatch *[]*db.UTXO) error {
 	// Create transaction record
 	txRecord := &db.Transaction{
 		BlockHeight: blockHeight,
@@ -204,133 +242,312 @@ func (bi *BlockImporter) processTransaction(dbTx *gorm.DB, txData btcjson.TxRawR
 		Weight:      int(txData.Weight),
 		Version:     int32(txData.Version),
 		Locktime:    txData.LockTime,
-		BlockTime:   blockTime,
+		BlockTime:   time.Unix(txData.Time, 0),
 		CreatedAt:   time.Now(),
 	}
 
-	// Store inputs and outputs as JSON
+	// Serialize vin/vout JSON
 	vinJSON, err := json.Marshal(txData.Vin)
 	if err != nil {
-		return fmt.Errorf("failed to marshal vin: %v", err)
+		return fmt.Errorf("failed to marshal vin data: %v", err)
 	}
 	txRecord.Vin = vinJSON
 
 	voutJSON, err := json.Marshal(txData.Vout)
 	if err != nil {
-		return fmt.Errorf("failed to marshal vout: %v", err)
+		return fmt.Errorf("failed to marshal vout data: %v", err)
 	}
 	txRecord.Vout = voutJSON
 
-	// Save transaction to database
+	// Save transaction, ignore duplicates
 	if err := dbTx.Clauses(clause.OnConflict{DoNothing: true}).Create(txRecord).Error; err != nil {
 		return fmt.Errorf("failed to save transaction: %v", err)
 	}
 
-	// First, process inputs to handle spends (skip coinbase)
-	for _, vin := range txData.Vin {
-		if vin.Coinbase != "" {
-			continue // coinbase has no spend
+	// In the first pass we skip address and UTXO processing
+	// This is handled in a second pass by ProcessAddressesAndUTXOs
+
+	return nil
+}
+
+// ProcessAddressesAndUTXOs is the second pass of the two-pass import
+// It processes all transactions to extract addresses, create UTXOs and update address balances
+// This should be called after all blocks and transactions are imported
+func (bi *BlockImporter) ProcessAddressesAndUTXOs(startHeight, endHeight int64) error {
+	log.Printf("Starting second-pass processing for addresses and UTXOs from block %d to %d", startHeight, endHeight)
+	
+	// If endHeight is -1 (MaxHeight), get the actual highest block height from the database
+	if endHeight == MaxHeight {
+		var maxHeight int64
+		result := bi.DB.Model(&db.Block{}).Select("COALESCE(MAX(height), 0)").Scan(&maxHeight)
+		if result.Error != nil {
+			return fmt.Errorf("failed to get max block height: %v", result.Error)
 		}
-
-		// locate the UTXO being spent
-		var utxo db.UTXO
-		err := dbTx.Where("tx_id = ? AND vout_index = ?", vin.Txid, vin.Vout).First(&utxo).Error
-		if err == nil {
-			// debit balance
-			if err := dbTx.Exec(`
-				UPDATE addresses SET balance = balance - ?, updated_at = NOW() WHERE address = ?`, utxo.Amount, utxo.Address).Error; err != nil {
-				return fmt.Errorf("failed to debit balance: %v", err)
-			}
-
-			// outgoing address transaction
-			addrTx := &db.AddressTransaction{
-				Address:     utxo.Address,
-				TxID:        txData.Txid,
-				BlockHeight: blockHeight,
-				Amount:      -utxo.Amount,
-				IsOutgoing:  true,
-				CreatedAt:   time.Now(),
-			}
-			_ = dbTx.Clauses(clause.OnConflict{DoNothing: true}).Create(addrTx).Error
-
-			// remove utxo
-			dbTx.Delete(&utxo)
-		}
+		endHeight = maxHeight
+		log.Printf("Using maximum available block height: %d", endHeight)
 	}
 
-	// Process outputs to update address balances
-	for _, vout := range txData.Vout {
-		var addrs []string
-		if len(vout.ScriptPubKey.Addresses) > 0 {
-			addrs = vout.ScriptPubKey.Addresses
-		} else {
-			// Legacy scripts (e.g., P2PK) don't include an address list – derive it
-			scriptHex := vout.ScriptPubKey.Hex
-			scriptBytes, err := hex.DecodeString(scriptHex)
-			if err == nil {
-				class, extracted, _, err := txscript.ExtractPkScriptAddrs(scriptBytes, &chaincfg.MainNetParams)
-				if err == nil {
-					if class == txscript.PubKeyTy {
-						// keep raw pubkey as identifier (mempool.space style)
-						if pushed, err := txscript.PushedData(scriptBytes); err == nil && len(pushed) == 1 {
-							addrs = append(addrs, hex.EncodeToString(pushed[0]))
-						}
-					} else {
-						for _, a := range extracted {
-							addrs = append(addrs, a.EncodeAddress())
-						}
-					}
+	// Process blocks in batches to avoid memory issues
+	for batchStart := startHeight; batchStart <= endHeight; batchStart += BlockBatchSize {
+		batchEnd := batchStart + BlockBatchSize - 1
+		if batchEnd > endHeight {
+			batchEnd = endHeight
+		}
+		
+		// Process this batch of blocks
+		if err := bi.processBatchAddressesAndUTXOs(batchStart, batchEnd); err != nil {
+			log.Printf("Error processing batch %d-%d: %v", batchStart, batchEnd, err)
+			return err
+		}
+		
+		// Log progress
+		log.Printf("Processed blocks %d-%d (%.2f%%)", 
+			batchStart, batchEnd, float64(batchEnd-startHeight+1)/float64(endHeight-startHeight+1)*100)
+	}
+	
+	log.Printf("Completed second-pass processing for addresses and UTXOs")
+	return nil
+}
+
+// processBatchAddressesAndUTXOs processes a batch of blocks to extract addresses and build UTXOs
+func (bi *BlockImporter) processBatchAddressesAndUTXOs(startHeight, endHeight int64) error {
+	// Start a DB transaction for this batch
+	dbTx := bi.DB.Begin()
+	if dbTx.Error != nil {
+		return fmt.Errorf("failed to begin db transaction: %v", dbTx.Error)
+	}
+	
+	// Handle any panics and rollback
+	defer func() {
+		if r := recover(); r != nil {
+			dbTx.Rollback()
+			log.Printf("recovered from panic in processBatchAddressesAndUTXOs: %v", r)
+		}
+	}()
+	
+	// Initialize batch collections
+	addrTxBatch := make([]*db.AddressTransaction, 0, AddrTxBatchSize)
+	utxoBatch := make([]*db.UTXO, 0, UTXOBatchSize)
+	addrBatch := make(map[string]*db.Address) // Use map to avoid duplicates within batch
+	
+	// Fetch all transactions for blocks in this batch
+	var transactions []db.Transaction
+	result := dbTx.Where("block_height BETWEEN ? AND ?", startHeight, endHeight).Order("block_height ASC, id ASC").Find(&transactions)
+	if result.Error != nil {
+		dbTx.Rollback()
+		return fmt.Errorf("failed to fetch transactions: %v", result.Error)
+	}
+	
+	log.Printf("Processing %d transactions for blocks %d-%d", len(transactions), startHeight, endHeight)
+	
+	// Process each transaction
+	for _, tx := range transactions {
+		// Process this transaction's addresses and UTXOs
+		if err := bi.extractAddressesAndUTXOs(dbTx, &tx, &addrTxBatch, &utxoBatch, addrBatch); err != nil {
+			dbTx.Rollback()
+			return fmt.Errorf("failed to process transaction %s: %v", tx.Txid, err)
+		}
+		
+		// Flush batches if they're full
+		if len(addrTxBatch) >= AddrTxBatchSize {
+			if err := dbTx.Clauses(clause.OnConflict{DoNothing: true}).Create(&addrTxBatch).Error; err != nil {
+				dbTx.Rollback()
+				return fmt.Errorf("failed to insert address transactions batch: %v", err)
+			}
+			addrTxBatch = addrTxBatch[:0] // Clear batch but keep capacity
+		}
+		
+		if len(utxoBatch) >= UTXOBatchSize {
+			if err := dbTx.Clauses(clause.OnConflict{DoNothing: true}).Create(&utxoBatch).Error; err != nil {
+				dbTx.Rollback()
+				return fmt.Errorf("failed to insert UTXOs batch: %v", err)
+			}
+			utxoBatch = utxoBatch[:0] // Clear batch but keep capacity
+		}
+		
+		// Insert addresses in batches
+		if len(addrBatch) >= AddressBatchSize {
+			addresses := make([]*db.Address, 0, len(addrBatch))
+			for _, addr := range addrBatch {
+				addresses = append(addresses, addr)
+			}
+			
+			if err := dbTx.Clauses(clause.OnConflict{DoNothing: true}).Create(&addresses).Error; err != nil {
+				dbTx.Rollback()
+				return fmt.Errorf("failed to insert addresses batch: %v", err)
+			}
+			// Clear the batch
+			addrBatch = make(map[string]*db.Address)
+		}
+	}
+	
+	// Insert any remaining items in batches
+	if len(addrTxBatch) > 0 {
+		if err := dbTx.Clauses(clause.OnConflict{DoNothing: true}).Create(&addrTxBatch).Error; err != nil {
+			dbTx.Rollback()
+			return fmt.Errorf("failed to insert remaining address transactions: %v", err)
+		}
+	}
+	
+	if len(utxoBatch) > 0 {
+		if err := dbTx.Clauses(clause.OnConflict{DoNothing: true}).Create(&utxoBatch).Error; err != nil {
+			dbTx.Rollback()
+			return fmt.Errorf("failed to insert remaining UTXOs: %v", err)
+		}
+	}
+	
+	if len(addrBatch) > 0 {
+		addresses := make([]*db.Address, 0, len(addrBatch))
+		for _, addr := range addrBatch {
+			addresses = append(addresses, addr)
+		}
+		
+		if err := dbTx.Clauses(clause.OnConflict{DoNothing: true}).Create(&addresses).Error; err != nil {
+			dbTx.Rollback()
+			return fmt.Errorf("failed to insert remaining addresses: %v", err)
+		}
+	}
+	
+	// Update all address balances for addresses in this batch
+	if err := bi.updateAddressBalances(dbTx, startHeight, endHeight); err != nil {
+		dbTx.Rollback()
+		return fmt.Errorf("failed to update address balances: %v", err)
+	}
+	
+	// Commit the transaction
+	if err := dbTx.Commit().Error; err != nil {
+		return fmt.Errorf("failed to commit batch: %v", err)
+	}
+	
+	return nil
+}
+
+// extractAddressesAndUTXOs extracts addresses from transaction inputs and outputs
+// and creates UTXO records for each output
+func (bi *BlockImporter) extractAddressesAndUTXOs(dbTx *gorm.DB, tx *db.Transaction, addrTxBatch *[]*db.AddressTransaction, utxoBatch *[]*db.UTXO, addrBatch map[string]*db.Address) error {
+	// Parse vout data to extract addresses and create UTXOs
+	var vout []btcjson.Vout
+	if err := json.Unmarshal(tx.Vout, &vout); err != nil {
+		return fmt.Errorf("failed to unmarshal vout data: %v", err)
+	}
+
+	// Process outputs to create UTXOs and extract addresses
+	for voutIdx, output := range vout {
+		// Skip outputs with no value
+		if output.Value <= 0 {
+			continue
+		}
+
+		// Convert from BTC to satoshis (100,000,000 satoshis = 1 BTC)
+		amtSat := int64(output.Value * 100000000)
+		
+		// Extract addresses from output
+		for _, addr := range output.ScriptPubKey.Addresses {
+			// Add the address to the batch if not already exists
+			if _, exists := addrBatch[addr]; !exists {
+				addrBatch[addr] = &db.Address{
+					Address:   addr,
+					Balance:   0, // Will be updated later by aggregation
+					CreatedAt: time.Now(),
 				}
 			}
-		}
 
-		if len(addrs) == 0 {
-			continue // nothing we can attribute
-		}
-
-		// Convert amount from BTC to satoshis
-		satoshis := int64(vout.Value * 100_000_000)
-
-		for _, addr := range addrs {
-			// Update address balance (upsert)
-			err := dbTx.Exec(`
-				INSERT INTO addresses (address, balance, tx_count, created_at, updated_at)
-				VALUES (?, ?, 1, NOW(), NOW())
-				ON CONFLICT (address) 
-				DO UPDATE SET 
-				  balance = addresses.balance + ?,
-				  tx_count = addresses.tx_count + 1,
-				  updated_at = NOW()
-			`, addr, satoshis, satoshis).Error
-
-			if err != nil {
-				return fmt.Errorf("failed to update address balance: %v", err)
-			}
-
-			// Record address transaction (incoming)
-			addrTx := &db.AddressTransaction{
-				Address:     addr,
-				TxID:        txData.Txid,
-				BlockHeight: blockHeight,
-				Amount:      satoshis,
-				IsOutgoing:  false, // This is a receive transaction
-				CreatedAt:   time.Now(),
-			}
-			if err := dbTx.Clauses(clause.OnConflict{DoNothing: true}).Create(addrTx).Error; err != nil {
-				return fmt.Errorf("failed to record address transaction: %v", err)
-			}
-
-			// insert new utxo
+			// Create UTXO for this output
+			// Make sure we use uint32 for VoutIndex as per model definition
 			utxo := &db.UTXO{
-				TxID:      txData.Txid,
-				VoutIndex: vout.N,
+				ID:        uuid.New(),
+				TxID:      tx.Txid,
+				VoutIndex: uint32(voutIdx),
 				Address:   addr,
-				Amount:    satoshis,
+				Amount:    amtSat,
 				CreatedAt: time.Now(),
 			}
-			_ = dbTx.Clauses(clause.OnConflict{DoNothing: true}).Create(utxo).Error
+
+			// Create address transaction record
+			addrTx := &db.AddressTransaction{
+				Address:     addr,
+				TxID:        tx.Txid,
+				BlockHeight: tx.BlockHeight,
+				Amount:      amtSat, // Positive for outputs
+				CreatedAt:   time.Now(),
+			}
+
+			// Add to batches
+			*addrTxBatch = append(*addrTxBatch, addrTx)
+			*utxoBatch = append(*utxoBatch, utxo)
 		}
 	}
 
+	// Parse vin data to handle spent UTXOs and create negative address transactions
+	var vin []btcjson.Vin
+	if err := json.Unmarshal(tx.Vin, &vin); err != nil {
+		return fmt.Errorf("failed to unmarshal vin data: %v", err)
+	}
+
+	// Process inputs (remove spent UTXOs and create negative address transactions)
+	for _, input := range vin {
+		// Skip coinbase transactions
+		if input.IsCoinBase() {
+			continue
+		}
+
+		// Find the previous output UTXO
+		var prevUTXO db.UTXO
+		result := dbTx.Where("tx_id = ? AND vout_index = ?", input.Txid, input.Vout).First(&prevUTXO)
+		if result.Error != nil {
+			// In the two-pass architecture, all UTXOs should exist at this point
+			// Log this as information but don't fail - all transactions should be imported in order
+			log.Printf("Info: UTXO not found for input %s:%d in tx %s, skipping", input.Txid, input.Vout, tx.Txid)
+			continue
+		}
+
+		// Since our UTXO model doesn't track spent status, we need to remove the UTXO when spent
+		// Delete the UTXO since it's been spent
+		if err := dbTx.Delete(&prevUTXO).Error; err != nil {
+			return fmt.Errorf("failed to delete spent UTXO: %v", err)
+		}
+
+		// Create negative address transaction for the spent amount
+		addrTx := &db.AddressTransaction{
+			Address:     prevUTXO.Address,
+			TxID:        tx.Txid,
+			BlockHeight: tx.BlockHeight,
+			Amount:      -prevUTXO.Amount, // Negative for inputs
+			CreatedAt:   time.Now(),
+		}
+
+		// Add to batch
+		*addrTxBatch = append(*addrTxBatch, addrTx)
+	}
+
+	return nil
+}
+
+// updateAddressBalances updates address balances based on transaction data for the specified block range
+func (bi *BlockImporter) updateAddressBalances(dbTx *gorm.DB, startHeight, endHeight int64) error {
+	log.Printf("Updating address balances for blocks %d-%d", startHeight, endHeight)
+
+	// Use efficient SQL to update address balances based on the sum of address transactions
+	// This is much faster than processing each address individually
+	updateQuery := `
+	UPDATE addresses a
+	SET balance = (
+		SELECT COALESCE(SUM(amount), 0)
+		FROM address_transactions
+		WHERE address = a.address
+	)
+	WHERE a.address IN (
+		SELECT DISTINCT address
+		FROM address_transactions
+		WHERE block_height BETWEEN ? AND ?
+	)
+	`
+
+	result := dbTx.Exec(updateQuery, startHeight, endHeight)
+	if result.Error != nil {
+		return fmt.Errorf("failed to update address balances: %v", result.Error)
+	}
+
+	log.Printf("Updated balances for addresses affected by blocks %d-%d", startHeight, endHeight)
 	return nil
 }
