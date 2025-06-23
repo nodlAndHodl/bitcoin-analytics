@@ -10,26 +10,24 @@ import (
 
 // Block represents a Bitcoin block
 type Block struct {
-	ID                uuid.UUID      `gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
-	Height            int64          `gorm:"uniqueIndex;not null"`
-	Hash              string         `gorm:"uniqueIndex;not null"`
-	Version           int32          `gorm:"not null"`
-	VersionHex        string         `gorm:"not null"`
-	MerkleRoot        string         `gorm:"not null"`
-	Time              time.Time      `gorm:"not null;index"`
-	MedianTime        time.Time      `gorm:"not null"`
-	Nonce             uint32         `gorm:"not null"`
-	Bits              string         `gorm:"not null"`
-	Difficulty        float64        `gorm:"not null"`
-	Chainwork         string         `gorm:"not null"`
-	NTx               int            `gorm:"not null"`
-	PreviousBlockHash string         `gorm:"not null"`
-	NextBlockHash     string         `gorm:"not null"`
-	StrippedSize      int            `gorm:"not null"`
-	Size              int            `gorm:"not null"`
-	Weight            int            `gorm:"not null"`
-	Tx                datatypes.JSON `gorm:"type:jsonb"`
-	CreatedAt         time.Time      `gorm:"not null"`
+	ID                uuid.UUID `gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
+	Height            int64     `gorm:"uniqueIndex;not null"`
+	Hash              string    `gorm:"uniqueIndex;not null"`
+	Version           int32     `gorm:"not null"`
+	VersionHex        string    `gorm:"not null"`
+	MerkleRoot        string    `gorm:"not null"`
+	Time              time.Time `gorm:"not null;index"`
+	MedianTime        time.Time `gorm:"not null"`
+	Nonce             uint32    `gorm:"not null"`
+	Bits              string    `gorm:"not null"`
+	Difficulty        float64   `gorm:"not null"`
+	Chainwork         string    `gorm:"not null"`
+	NTx               int       `gorm:"not null"`
+	PreviousBlockHash string    `gorm:"not null"`
+	NextBlockHash     string    `gorm:"not null"`
+	StrippedSize      int       `gorm:"not null"`
+	Size              int       `gorm:"not null"`
+	Weight            int       `gorm:"not null"`
 }
 
 // Transaction represents a Bitcoin transaction
@@ -47,28 +45,36 @@ type Transaction struct {
 	Vin         datatypes.JSON `gorm:"type:jsonb"`
 	Vout        datatypes.JSON `gorm:"type:jsonb"`
 	BlockTime   time.Time      `gorm:"not null;index"`
-	CreatedAt   time.Time      `gorm:"not null"`
 }
 
-// Address represents a Bitcoin address and its balance
+// Address represents data from the address_balances view
 type Address struct {
-	ID        uuid.UUID `gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
-	Address   string    `gorm:"uniqueIndex;not null"`
-	Balance   int64     `gorm:"not null;default:0"` // in satoshis
-	TxCount   int64     `gorm:"not null;default:0"`
-	CreatedAt time.Time `gorm:"not null"`
-	UpdatedAt time.Time `gorm:"not null"`
+	Address          string `gorm:"primarykey" json:"address"`
+	TransactionCount int64  `gorm:"column:tx_count" json:"transaction_count"`
+	Balance          int64  `json:"balance"`                                           // In satoshis
+	CoinbaseBalance  int64  `gorm:"column:coinbase_balance" json:"coinbase_balance"`   // Mining rewards
+	CoinbaseTxCount  int64  `gorm:"column:coinbase_tx_count" json:"coinbase_tx_count"` // Count of mining reward transactions
 }
 
-// AddressTransaction tracks transactions per address
+// TableName sets the table name for Address model to use our custom materialized view
+func (Address) TableName() string {
+	return "address_balances"
+}
+
+// AddressTransaction represents a transaction involving a specific address
 type AddressTransaction struct {
-	ID          uuid.UUID `gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
-	Address     string    `gorm:"not null;index"`
-	TxID        string    `gorm:"not null;index"`
-	BlockHeight int64     `gorm:"not null;index"`
-	Amount      int64     `gorm:"not null"` // in satoshis
-	IsOutgoing  bool      `gorm:"not null"` // true if this is an output from the address
-	CreatedAt   time.Time `gorm:"not null"`
+	ID          uuid.UUID `gorm:"type:uuid;primary_key" json:"id"`
+	Address     string    `gorm:"index" json:"address"`
+	TxID        string    `gorm:"column:tx_id;index" json:"tx_id"` // Current transaction ID
+	BlockHeight int64     `gorm:"index" json:"block_height"`
+	Amount      int64     `json:"amount"`                        // In satoshis, can be negative (for inputs/spends)
+	Coinbase    bool      `gorm:"default:false" json:"coinbase"` // Whether this is a coinbase transaction (mining reward)
+
+	InputTxId *string `gorm:"column:input_tx_id" json:"input_tx_id"` // For inputs: which tx created the output being spent
+	InputVout *int    `gorm:"column:input_vout" json:"input_vout"`   // For inputs: which output index in the origin tx
+
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 // PricePoint represents OHLC price data
@@ -76,11 +82,8 @@ type AddressTransaction struct {
 // Unique by timestamp + currency
 type PricePoint struct {
 	ID        uuid.UUID `gorm:"type:uuid;primary_key;"`
-	CreatedAt time.Time
-	UpdatedAt time.Time
-	DeletedAt gorm.DeletedAt `gorm:"index"`
-	Timestamp time.Time      `gorm:"uniqueIndex:idx_timestamp_currency;index"`
-	Currency  string         `gorm:"uniqueIndex:idx_timestamp_currency"`
+	Timestamp time.Time `gorm:"uniqueIndex:idx_timestamp_currency;index"`
+	Currency  string    `gorm:"uniqueIndex:idx_timestamp_currency"`
 	Open      float64
 	High      float64
 	Low       float64
@@ -93,25 +96,15 @@ func (p *PricePoint) BeforeCreate(tx *gorm.DB) (err error) {
 	return
 }
 
-// UTXO represents an unspent transaction output
-type UTXO struct {
-	ID        uuid.UUID `gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
-	TxID      string    `gorm:"not null;index:idx_utxo_ref"`
-	VoutIndex uint32    `gorm:"not null;index:idx_utxo_ref"`
-	Address   string    `gorm:"not null;index"`
-	Amount    int64     `gorm:"not null"` // in satoshis
-	CreatedAt time.Time `gorm:"not null"`
-}
-
 // MigrateModels runs database migrations
 func MigrateModels(db *gorm.DB) error {
+	// Note: We only auto-migrate actual tables, not materialized views
 	models := []interface{}{
 		&PricePoint{},
 		&Block{},
 		&Transaction{},
-		&Address{},
 		&AddressTransaction{},
-		&UTXO{},
+		// Views are created explicitly below, not via AutoMigrate
 	}
 
 	// Enable UUID extension if not exists
@@ -133,5 +126,39 @@ func MigrateModels(db *gorm.DB) error {
 		CREATE INDEX IF NOT EXISTS idx_address_transactions_txid ON address_transactions(tx_id);
 	`)
 
+	// Create view for address balances
+	db.Exec(`
+		CREATE OR REPLACE VIEW address_balances AS
+		SELECT 
+			address,
+			COUNT(DISTINCT tx_id) AS tx_count,
+			SUM(amount) AS balance,
+			SUM(CASE WHEN coinbase = true THEN amount ELSE 0 END) AS coinbase_balance,
+			COUNT(DISTINCT CASE WHEN coinbase = true THEN tx_id ELSE NULL END) AS coinbase_tx_count
+		FROM 
+			address_transactions
+		GROUP BY 
+			address
+		ORDER BY 
+			balance DESC;
+	`)
+
+	// No indexes needed for views - they'll use indexes from the base tables
+
+	// Add additional indexes on transactions and address_transactions to optimize view queries
+	db.Exec(`
+		-- Enhanced address transaction indexes
+		CREATE INDEX IF NOT EXISTS idx_address_transactions_address_amount ON address_transactions(address, amount);
+		CREATE INDEX IF NOT EXISTS idx_address_transactions_blockheight ON address_transactions(block_height);
+		
+		-- Indexes for efficient transaction lookup
+		CREATE INDEX IF NOT EXISTS idx_transactions_txid ON transactions(txid);
+		-- For JSONB operations
+		CREATE INDEX IF NOT EXISTS idx_transactions_vin_gin ON transactions USING GIN (vin);
+		CREATE INDEX IF NOT EXISTS idx_transactions_vout_gin ON transactions USING GIN (vout);
+	`)
+
 	return nil
 }
+
+// Views are automatically updated - no refresh functions needed

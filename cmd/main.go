@@ -62,11 +62,9 @@ func main() {
 	blockImporter := blockimporter.NewBlockImporter(dbConn, btcClient)
 
 	// Start block import in a separate goroutine
-	go func() {
-		if err := blockImporter.Start(); err != nil {
-			log.Printf("Error starting block importer: %v", err)
-		}
-	}()
+	if err := blockImporter.Start(); err != nil {
+		log.Printf("Error starting block importer: %v", err)
+	}
 	defer blockImporter.Stop()
 
 	// Start price data worker
@@ -80,10 +78,6 @@ func main() {
 
 	// Initialize API router using helper
 	router := api.SetupRouter(btcClient, api.Config{})
-
-	// Register explorer routes
-	explorerHandler := api.NewExplorerHandler(dbConn)
-	explorerHandler.RegisterRoutes(router)
 
 	port := os.Getenv("PORT")
 	if port == "" {
