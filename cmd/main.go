@@ -81,10 +81,6 @@ func main() {
 	// Initialize API router using helper
 	router := api.SetupRouter(btcClient, api.Config{})
 
-	// Register explorer routes
-	explorerHandler := api.NewExplorerHandler(dbConn)
-	explorerHandler.RegisterRoutes(router)
-
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"

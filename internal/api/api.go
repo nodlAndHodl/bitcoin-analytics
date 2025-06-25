@@ -1,12 +1,9 @@
 package api
 
 import (
-	"fmt"
 	"log"
 	"net/http"
 
-	"github.com/btcsuite/btcd/btcutil"
-	"github.com/btcsuite/btcd/chaincfg"
 	"github.com/btcsuite/btcd/rpcclient"
 	"github.com/gin-gonic/gin"
 	"github.com/nodlAndHodl/bitcoin-analytics/internal/bitcoinrpc"
@@ -96,35 +93,6 @@ func handleGetAddressUTXOs(btcClient *rpcclient.Client) gin.HandlerFunc {
 
 		c.JSON(http.StatusOK, response)
 	}
-}
-
-func getAddressUTXOs(client *rpcclient.Client, address string) ([]UTXOResponse, error) {
-	// First, validate the address
-	addr, err := btcutil.DecodeAddress(address, &chaincfg.MainNetParams)
-	if err != nil {
-		return nil, fmt.Errorf("invalid Bitcoin address: %v", err)
-	}
-
-	// Get all unspent transaction outputs for the address
-	unspentOutputs, err := client.ListUnspentMinMaxAddresses(0, 9999999, []btcutil.Address{addr})
-	if err != nil {
-		return nil, fmt.Errorf("error getting unspent outputs: %v", err)
-	}
-
-	// Convert to our response format
-	var result []UTXOResponse
-	for _, utxo := range unspentOutputs {
-		result = append(result, UTXOResponse{
-			TxID:          utxo.TxID,
-			Vout:          utxo.Vout,
-			Address:       address,
-			Amount:        utxo.Amount,
-			Confirmations: utxo.Confirmations,
-			Spendable:     utxo.Spendable,
-		})
-	}
-
-	return result, nil
 }
 
 func SetupRouter(btcClient *rpcclient.Client, cfg Config) *gin.Engine {
