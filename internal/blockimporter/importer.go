@@ -46,20 +46,19 @@ func (bi *BlockImporter) Start() error {
 	}
 
 	// Get the current height from the database
-	var currentHeight int64
-	result := bi.DB.Model(&db.Block{}).Select("COALESCE(MAX(height), -1)").Scan(&currentHeight)
+	var dbBlockHeight int64
+	result := bi.DB.Model(&db.Block{}).Select("COALESCE(MAX(height), -1)").Scan(&dbBlockHeight)
 	if result.Error != nil {
 		return fmt.Errorf("failed to get current height: %v", result.Error)
 	}
 
 	// Start importing from the next block (if we are behind)
-	startHeight := currentHeight + 1
+	startHeight := dbBlockHeight + 1
 	if startHeight <= nodeHeight {
 		log.Printf("Starting block import from height %d to %d", startHeight, nodeHeight)
 		bi.importBlocks(startHeight, nodeHeight) // blocking until catch-up complete
-		// All addresses and UTXOs are now processed in the first pass
 	} else {
-		log.Printf("already at latest block height: %d", currentHeight)
+		log.Printf("already at latest block height: %d", dbBlockHeight)
 	}
 
 	// Begin periodic polling for new blocks once the initial catch-up is finished
@@ -95,6 +94,8 @@ func (bi *BlockImporter) Start() error {
 
 // Stop signals the importer to shut down
 func (bi *BlockImporter) Stop() {
+	log.Println("Shutting down block importer...")
+	bi.RPC.Shutdown()
 	close(bi.shutdown)
 }
 
@@ -110,7 +111,6 @@ func (bi *BlockImporter) importBlocks(startHeight, endHeight int64) {
 				log.Printf("Error getting block hash at height %d: %v", height, err)
 				continue
 			}
-
 			// Get block with verbose transaction data
 			block, err := bi.RPC.GetBlockVerboseTx(hash)
 			if err != nil {
@@ -133,9 +133,6 @@ func (bi *BlockImporter) importBlocks(startHeight, endHeight int64) {
 func (bi *BlockImporter) processBlock(block *btcjson.GetBlockVerboseTxResult) error {
 	// Convert block time to time.Time
 	blockTime := time.Unix(block.Time, 0)
-	// For now, use block time as median time
-	// The MedianTime field is not available in the verbose block response
-	medianTime := blockTime
 
 	// Create block record
 	blockRecord := &db.Block{
@@ -144,8 +141,7 @@ func (bi *BlockImporter) processBlock(block *btcjson.GetBlockVerboseTxResult) er
 		Version:           int32(block.Version),
 		VersionHex:        fmt.Sprintf("%08x", block.Version),
 		MerkleRoot:        block.MerkleRoot,
-		Time:              blockTime,
-		MedianTime:        medianTime,
+		BlockTime:         blockTime,
 		Nonce:             block.Nonce,
 		Bits:              block.Bits,
 		Difficulty:        block.Difficulty,
@@ -156,8 +152,6 @@ func (bi *BlockImporter) processBlock(block *btcjson.GetBlockVerboseTxResult) er
 		Size:              int(block.Size),
 		Weight:            int(block.Weight),
 	}
-
-	// Store transaction hashes as JSON
 
 	// Start a DB transaction for this block and its transactions
 	dbTx := bi.DB.Begin()
@@ -180,10 +174,7 @@ func (bi *BlockImporter) processBlock(block *btcjson.GetBlockVerboseTxResult) er
 	}
 
 	// Process each transaction in the block
-	// Use the transaction data already provided by GetBlockVerboseTx
-	// This eliminates the need for additional RPC calls
 	for _, txData := range block.Tx {
-		// Process transaction - first pass only stores transaction data
 		err := bi.processTransaction(dbTx, txData, block.Height)
 		if err != nil {
 			dbTx.Rollback()
@@ -199,21 +190,40 @@ func (bi *BlockImporter) processBlock(block *btcjson.GetBlockVerboseTxResult) er
 	return nil
 }
 
-// Constants for batch processing
-const (
-	AddrTxBatchSize = 1000 // Increased batch size for better performance
-	BlockBatchSize  = 100  // Process this many blocks before processing their addresses
-	MaxHeight       = -1   // Used to process all available blocks
-)
+func extractAddresses(scriptPubkey *btcjson.ScriptPubKeyResult) []string {
+	var addresses []string
+	if len(scriptPubkey.Addresses) > 0 {
+		addresses = scriptPubkey.Addresses
+	} else if scriptPubkey.Hex != "" {
+		// Parse the script to get addresses
+		script, err := hex.DecodeString(scriptPubkey.Hex)
+		if err == nil {
+			class, scriptAddrs, _, err := txscript.ExtractPkScriptAddrs(script, &chaincfg.MainNetParams)
+			if err == nil {
+				// Special case for P2PK scripts (mempool.space style)
+				if class == txscript.PubKeyTy {
+					// Keep raw pubkey as identifier
+					if pushed, err := txscript.PushedData(script); err == nil && len(pushed) > 0 {
+						pubkeyStr := hex.EncodeToString(pushed[0])
+						addresses = append(addresses, pubkeyStr)
+					}
+				} else if len(scriptAddrs) > 0 {
+					// Standard script with addresses
+					for _, scriptAddr := range scriptAddrs {
+						addresses = append(addresses, scriptAddr.EncodeAddress())
+					}
+				}
+			}
+		}
+	}
+	return addresses
+}
 
-// First-pass processing: Store blocks and transaction data, and address transactions
 func (bi *BlockImporter) processTransaction(dbTx *gorm.DB, txData btcjson.TxRawResult, blockHeight int64) error {
-	// Track addresses involved in this transaction to avoid double-counting tx_count
 	addressesInTx := make(map[string]bool)
 
-	// Check if this is a coinbase transaction (first transaction in a block)
 	isCoinbase := len(txData.Vin) > 0 && txData.Vin[0].Coinbase != ""
-	// Create transaction record
+
 	txRecord := &db.Transaction{
 		BlockHeight: blockHeight,
 		Hex:         txData.Hex,
@@ -226,29 +236,25 @@ func (bi *BlockImporter) processTransaction(dbTx *gorm.DB, txData btcjson.TxRawR
 		Locktime:    uint32(txData.LockTime),
 	}
 
-	// Serialize vin to JSON
 	vinJSON, err := json.Marshal(txData.Vin)
 	if err != nil {
 		return fmt.Errorf("failed to marshal vin: %v", err)
 	}
 	txRecord.Vin = vinJSON
 
-	// Serialize vout to JSON
 	voutJSON, err := json.Marshal(txData.Vout)
 	if err != nil {
 		return fmt.Errorf("failed to marshal vout: %v", err)
 	}
 	txRecord.Vout = voutJSON
 
-	// Save transaction, ignore duplicates
 	if err := dbTx.Clauses(clause.OnConflict{DoNothing: true}).Create(txRecord).Error; err != nil {
 		return fmt.Errorf("failed to save transaction: %v", err)
-
 	}
 
 	// Process inputs - create negative address transactions for spent outputs
 	for _, input := range txData.Vin {
-		// Skip coinbase inputs
+		// Skip coinbase inputs handled below in outputs
 		if isCoinbase {
 			continue
 		}
@@ -263,44 +269,20 @@ func (bi *BlockImporter) processTransaction(dbTx *gorm.DB, txData btcjson.TxRawR
 			var vouts []btcjson.Vout
 			if err := json.Unmarshal(referencedTx.Vout, &vouts); err != nil {
 				log.Printf("Error unmarshaling vout data for tx %s: %v", input.Txid, err)
-				continue
+				panic(err)
 			}
 
 			// Make sure the vout index is within range
 			if int(input.Vout) >= len(vouts) {
 				log.Printf("Vout index %d out of range for tx %s", input.Vout, input.Txid)
-				continue
+				panic("vout index out of range")
 			}
 
 			// Get the output being spent
 			output := vouts[input.Vout]
 
 			// Extract the address(es) from the output
-			var addresses []string
-			if len(output.ScriptPubKey.Addresses) > 0 {
-				addresses = output.ScriptPubKey.Addresses
-			} else if output.ScriptPubKey.Hex != "" {
-				// Parse the script to get addresses
-				script, err := hex.DecodeString(output.ScriptPubKey.Hex)
-				if err == nil {
-					class, scriptAddrs, _, err := txscript.ExtractPkScriptAddrs(script, &chaincfg.MainNetParams)
-					if err == nil {
-						// Special case for P2PK scripts (mempool.space style)
-						if class == txscript.PubKeyTy {
-							// Keep raw pubkey as identifier
-							if pushed, err := txscript.PushedData(script); err == nil && len(pushed) > 0 {
-								pubkeyStr := hex.EncodeToString(pushed[0])
-								addresses = append(addresses, pubkeyStr)
-							}
-						} else if len(scriptAddrs) > 0 {
-							// Standard script with addresses
-							for _, scriptAddr := range scriptAddrs {
-								addresses = append(addresses, scriptAddr.EncodeAddress())
-							}
-						}
-					}
-				}
-			}
+			addresses := extractAddresses(&output.ScriptPubKey)
 
 			// Convert BTC to satoshis
 			amtSat := int64(output.Value * 100000000)
@@ -326,8 +308,11 @@ func (bi *BlockImporter) processTransaction(dbTx *gorm.DB, txData btcjson.TxRawR
 
 				if err := dbTx.Clauses(clause.OnConflict{DoNothing: true}).Create(&addrTx).Error; err != nil {
 					log.Printf("Error creating spend address transaction for %s: %v", addr, err)
+					panic(err)
 				}
 			}
+		} else {
+			panic(result.Error)
 		}
 	}
 
@@ -342,33 +327,7 @@ func (bi *BlockImporter) processTransaction(dbTx *gorm.DB, txData btcjson.TxRawR
 		amtSat := int64(output.Value * 100000000)
 
 		// Extract addresses from output
-		var addresses []string
-
-		// First check if RPC server provided addresses
-		if len(output.ScriptPubKey.Addresses) > 0 {
-			addresses = output.ScriptPubKey.Addresses
-		} else if output.ScriptPubKey.Hex != "" {
-			// If no addresses but we have script hex, parse it
-			script, err := hex.DecodeString(output.ScriptPubKey.Hex)
-			if err == nil {
-				class, scriptAddrs, _, err := txscript.ExtractPkScriptAddrs(script, &chaincfg.MainNetParams)
-				if err == nil {
-					// Special case for P2PK scripts (mempool.space style)
-					if class == txscript.PubKeyTy {
-						// Keep raw pubkey as identifier
-						if pushed, err := txscript.PushedData(script); err == nil && len(pushed) > 0 {
-							pubkeyStr := hex.EncodeToString(pushed[0])
-							addresses = append(addresses, pubkeyStr)
-						}
-					} else if len(scriptAddrs) > 0 {
-						// Standard script with addresses
-						for _, scriptAddr := range scriptAddrs {
-							addresses = append(addresses, scriptAddr.EncodeAddress())
-						}
-					}
-				}
-			}
-		}
+		addresses := extractAddresses(&output.ScriptPubKey)
 
 		// If we found addresses, create the necessary records
 		for _, addr := range addresses {
@@ -390,6 +349,7 @@ func (bi *BlockImporter) processTransaction(dbTx *gorm.DB, txData btcjson.TxRawR
 
 			if err := dbTx.Clauses(clause.OnConflict{DoNothing: true}).Create(&addrTx).Error; err != nil {
 				log.Printf("Error creating address transaction for %s: %v", addr, err)
+				panic(err)
 			}
 		}
 	}

@@ -16,8 +16,7 @@ type Block struct {
 	Version           int32     `gorm:"not null"`
 	VersionHex        string    `gorm:"not null"`
 	MerkleRoot        string    `gorm:"not null"`
-	Time              time.Time `gorm:"not null;index"`
-	MedianTime        time.Time `gorm:"not null"`
+	BlockTime         time.Time `gorm:"not null;index"`
 	Nonce             uint32    `gorm:"not null"`
 	Bits              string    `gorm:"not null"`
 	Difficulty        float64   `gorm:"not null"`
@@ -72,9 +71,6 @@ type AddressTransaction struct {
 
 	InputTxId *string `gorm:"column:input_tx_id" json:"input_tx_id"` // For inputs: which tx created the output being spent
 	InputVout *int    `gorm:"column:input_vout" json:"input_vout"`   // For inputs: which output index in the origin tx
-
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
 }
 
 // PricePoint represents OHLC price data

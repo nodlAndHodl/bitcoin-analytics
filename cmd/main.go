@@ -62,9 +62,11 @@ func main() {
 	blockImporter := blockimporter.NewBlockImporter(dbConn, btcClient)
 
 	// Start block import in a separate goroutine
-	if err := blockImporter.Start(); err != nil {
-		log.Printf("Error starting block importer: %v", err)
-	}
+	go func() {
+		if err := blockImporter.Start(); err != nil {
+			log.Printf("Error starting block importer: %v", err)
+		}
+	}()
 	defer blockImporter.Stop()
 
 	// Start price data worker
