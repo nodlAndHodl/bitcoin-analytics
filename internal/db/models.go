@@ -116,7 +116,7 @@ func MigrateModels(db *gorm.DB) error {
 
 	// Create indexes
 	db.Exec(`
-		CREATE INDEX IF NOT EXISTS idx_blocks_time ON blocks(time);
+		CREATE INDEX IF NOT EXISTS idx_blocks_time ON blocks(block_time);
 		CREATE INDEX IF NOT EXISTS idx_transactions_block_height ON transactions(block_height);
 		CREATE INDEX IF NOT EXISTS idx_address_transactions_address ON address_transactions(address);
 		CREATE INDEX IF NOT EXISTS idx_address_transactions_txid ON address_transactions(tx_id);
