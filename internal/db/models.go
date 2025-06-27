@@ -1,6 +1,7 @@
 package db
 
 import (
+	"log"
 	"time"
 
 	"github.com/google/uuid"
@@ -114,12 +115,10 @@ func MigrateModels(db *gorm.DB) error {
 		}
 	}
 
-	// Create indexes
+	// Create only the most essential index needed during import
 	db.Exec(`
-		CREATE INDEX IF NOT EXISTS idx_blocks_time ON blocks(block_time);
-		CREATE INDEX IF NOT EXISTS idx_transactions_block_height ON transactions(block_height);
-		CREATE INDEX IF NOT EXISTS idx_address_transactions_address ON address_transactions(address);
-		CREATE INDEX IF NOT EXISTS idx_address_transactions_txid ON address_transactions(tx_id);
+		-- Critical for transaction lookups during import
+		CREATE INDEX IF NOT EXISTS idx_transactions_txid ON transactions(txid);
 	`)
 
 	// Create view for address balances
@@ -139,22 +138,34 @@ func MigrateModels(db *gorm.DB) error {
 			balance DESC;
 	`)
 
-	// No indexes needed for views - they'll use indexes from the base tables
-
-	// Add additional indexes on transactions and address_transactions to optimize view queries
-	db.Exec(`
-		-- Enhanced address transaction indexes
-		CREATE INDEX IF NOT EXISTS idx_address_transactions_address_amount ON address_transactions(address, amount);
-		CREATE INDEX IF NOT EXISTS idx_address_transactions_blockheight ON address_transactions(block_height);
-		
-		-- Indexes for efficient transaction lookup
-		CREATE INDEX IF NOT EXISTS idx_transactions_txid ON transactions(txid);
-		-- For JSONB operations
-		CREATE INDEX IF NOT EXISTS idx_transactions_vin_gin ON transactions USING GIN (vin);
-		CREATE INDEX IF NOT EXISTS idx_transactions_vout_gin ON transactions USING GIN (vout);
-	`)
-
 	return nil
 }
 
 // Views are automatically updated - no refresh functions needed
+
+// CreatePostImportIndexes creates performance-oriented indexes after the initial block import
+// This is separated from the initial migration to speed up the import process
+func CreatePostImportIndexes(db *gorm.DB) error {
+	// Log start of index creation
+	log.Println("Creating post-import performance indexes...")
+
+	// Create performance indexes
+	db.Exec(`
+		-- Standard query indexes
+		CREATE INDEX IF NOT EXISTS idx_blocks_time ON blocks(block_time);
+		CREATE INDEX IF NOT EXISTS idx_transactions_block_height ON transactions(block_height);
+		CREATE INDEX IF NOT EXISTS idx_address_transactions_address ON address_transactions(address);
+
+		-- Enhanced address transaction indexes for balance lookups
+		CREATE INDEX IF NOT EXISTS idx_address_transactions_address_amount ON address_transactions(address, amount);
+		CREATE INDEX IF NOT EXISTS idx_address_transactions_blockheight ON address_transactions(block_height);
+
+		-- Skip the expensive GIN indexes as they don't appear to be used in query patterns
+		-- Uncomment if you add queries that use JSON operators on these columns
+		-- CREATE INDEX IF NOT EXISTS idx_transactions_vin_gin ON transactions USING GIN (vin);
+		-- CREATE INDEX IF NOT EXISTS idx_transactions_vout_gin ON transactions USING GIN (vout);
+	`)
+
+	log.Println("Post-import indexes created successfully")
+	return nil
+}
