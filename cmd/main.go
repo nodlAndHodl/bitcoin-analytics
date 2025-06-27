@@ -46,9 +46,10 @@ func main() {
 	}
 
 	// Run migrations
-	if err := db.MigrateModels(dbConn); err != nil {
-		log.Fatalf("failed to migrate db: %v", err)
-	}
+	// log.Println("Running migrations...")
+	// if err := db.MigrateModels(dbConn); err != nil {
+	// 	log.Fatalf("failed to migrate db: %v", err)
+	// }
 
 	// Initialize Bitcoin RPC client
 	log.Println("Connecting to Bitcoin RPC...")
@@ -60,6 +61,14 @@ func main() {
 
 	// Initialize block importer
 	blockImporter := blockimporter.NewBlockImporter(dbConn, btcClient)
+
+	// Set callback to create performance indexes after initial import is complete
+	blockImporter.OnInitialImportComplete = func() {
+		log.Println("Initial block import completed, creating performance indexes...")
+		if err := db.CreatePostImportIndexes(dbConn); err != nil {
+			log.Printf("Error creating post-import indexes: %v", err)
+		}
+	}
 
 	// Start block import in a separate goroutine
 	go func() {
@@ -90,6 +99,26 @@ func main() {
 	server := &http.Server{
 		Addr:    fmt.Sprintf(":%s", port),
 		Handler: router,
+	}
+
+	go func() {
+		log.Printf("Server starting on port %s", port)
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("could not listen on %s: %v\n", port, err)
+		}
+	}()
+
+	// Wait for cancellation signal
+	<-ctx.Done()
+
+	// Shutdown server
+	log.Println("Server stopped")
+
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer shutdownCancel()
+
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		log.Fatalf("Server Shutdown Failed:%+v", err)
 	}
 
 	go func() {

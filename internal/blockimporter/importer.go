@@ -3,12 +3,15 @@ package blockimporter
 import (
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
+	"sync"
 	"time"
 
 	"github.com/btcsuite/btcd/btcjson"
 	"github.com/btcsuite/btcd/chaincfg"
+	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/rpcclient"
 	"github.com/btcsuite/btcd/txscript"
 	"github.com/google/uuid"
@@ -19,9 +22,11 @@ import (
 )
 
 type BlockImporter struct {
-	DB       *gorm.DB
-	RPC      *rpcclient.Client
-	shutdown chan struct{}
+	DB                      *gorm.DB
+	RPC                     *rpcclient.Client
+	shutdown                chan struct{}
+	OnInitialImportComplete func() // Callback to execute when initial import is complete
+	wg                      sync.WaitGroup
 }
 
 func NewBlockImporter(db *gorm.DB, rpc *rpcclient.Client) *BlockImporter {
@@ -33,6 +38,8 @@ func NewBlockImporter(db *gorm.DB, rpc *rpcclient.Client) *BlockImporter {
 }
 
 const pollInterval = 5 * time.Minute // how often to check for new blocks after initial sync
+
+var ErrBlockExists = errors.New("block already exists")
 
 // Start begins the block import process. It performs an initial one-off catch-up to the
 // node tip. After that completes it polls the node tip every `pollInterval` and imports
@@ -55,10 +62,34 @@ func (bi *BlockImporter) Start() error {
 	// Start importing from the next block (if we are behind)
 	startHeight := dbBlockHeight + 1
 	if startHeight <= nodeHeight {
-		log.Printf("Starting block import from height %d to %d", startHeight, nodeHeight)
-		bi.importBlocks(startHeight, nodeHeight) // blocking until catch-up complete
+		log.Printf("Starting bi-directional block import. DB height: %d, Node height: %d", dbBlockHeight, nodeHeight)
+		bi.wg.Add(2)
+
+		// Start historical import (forwards)
+		go func() {
+			defer bi.wg.Done()
+			log.Println("Starting historical-importer (forward sync)...")
+			bi.importBlocks(startHeight, nodeHeight, "forward")
+			log.Println("Historical-importer finished.")
+		}()
+
+		// Start recent import (backwards)
+		go func() {
+			defer bi.wg.Done()
+			log.Println("Starting syncing-importer (backward sync)...")
+			bi.importBlocks(nodeHeight, startHeight, "backward")
+			log.Println("Syncing-importer finished.")
+		}()
+
+		bi.wg.Wait() // Wait for both importers to meet in the middle
+		log.Println("Initial bi-directional sync complete.")
+
 	} else {
 		log.Printf("already at latest block height: %d", dbBlockHeight)
+	}
+
+	if bi.OnInitialImportComplete != nil {
+		bi.OnInitialImportComplete()
 	}
 
 	// Begin periodic polling for new blocks once the initial catch-up is finished
@@ -83,7 +114,7 @@ func (bi *BlockImporter) Start() error {
 
 				if nodeTip > dbTip {
 					log.Printf("detected new blocks – importing %d to %d", dbTip+1, nodeTip)
-					bi.importBlocks(dbTip+1, nodeTip)
+					bi.importBlocks(dbTip+1, nodeTip, "forward")
 				}
 			}
 		}
@@ -99,32 +130,52 @@ func (bi *BlockImporter) Stop() {
 	close(bi.shutdown)
 }
 
-func (bi *BlockImporter) importBlocks(startHeight, endHeight int64) {
-	for height := startHeight; height <= endHeight; height++ {
+func (bi *BlockImporter) importBlocks(startHeight, endHeight int64, direction string) {
+	processHeight := func(height int64) bool { // Return true to stop
 		select {
 		case <-bi.shutdown:
 			log.Println("Block import stopped by shutdown signal")
-			return
+			return true
 		default:
 			hash, err := bi.RPC.GetBlockHash(height)
 			if err != nil {
 				log.Printf("Error getting block hash at height %d: %v", height, err)
-				continue
+				return false // Continue to next block
 			}
 			// Get block with verbose transaction data
 			block, err := bi.RPC.GetBlockVerboseTx(hash)
 			if err != nil {
 				log.Printf("Error getting block at height %d: %v", height, err)
-				continue
+				return false // Continue
 			}
 
+			log.Printf("Processing block %d", height)
 			if err := bi.processBlock(block); err != nil {
+				if errors.Is(err, ErrBlockExists) {
+					log.Printf("[%s-importer] Halting at block %d: already imported.", direction, height)
+					return true // Stop
+				}
 				log.Printf("Error processing block %d: %v", height, err)
-				continue
+				return false // Continue
 			}
 
-			if height%1000 == 0 || height == endHeight {
-				log.Printf("Processed block %d/%d (%.2f%%)", height, endHeight, float64(height)/float64(endHeight)*100)
+			if height%1000 == 0 {
+				log.Printf("[%s-importer] Processed block %d", direction, height)
+			}
+		}
+		return false
+	}
+
+	if direction == "forward" {
+		for height := startHeight; height <= endHeight; height++ {
+			if processHeight(height) {
+				break
+			}
+		}
+	} else if direction == "backward" {
+		for height := startHeight; height >= endHeight; height-- {
+			if processHeight(height) {
+				break
 			}
 		}
 	}
@@ -153,41 +204,35 @@ func (bi *BlockImporter) processBlock(block *btcjson.GetBlockVerboseTxResult) er
 		Weight:            int(block.Weight),
 	}
 
-	// Start a DB transaction for this block and its transactions
-	dbTx := bi.DB.Begin()
-	if dbTx.Error != nil {
-		return fmt.Errorf("failed to begin db transaction: %v", dbTx.Error)
-	}
+	// Use a transaction for atomicity
+	err := bi.DB.Transaction(func(tx *gorm.DB) error {
+		// Save the block record
+		result := tx.Clauses(clause.OnConflict{
+			Columns:   []clause.Column{{Name: "height"}},
+			DoNothing: true,
+		}).Create(blockRecord)
 
-	// Handle any panics and rollback
-	defer func() {
-		if r := recover(); r != nil {
-			dbTx.Rollback()
-			log.Printf("recovered from panic in processBlock: %v", r)
+		if result.Error != nil {
+			return fmt.Errorf("failed to save block: %v", result.Error)
 		}
-	}()
 
-	// Insert block
-	if err := dbTx.Clauses(clause.OnConflict{DoNothing: true}).Create(blockRecord).Error; err != nil {
-		dbTx.Rollback()
-		return fmt.Errorf("failed to insert block: %v", err)
-	}
-
-	// Process each transaction in the block
-	for _, txData := range block.Tx {
-		err := bi.processTransaction(dbTx, txData, block.Height)
-		if err != nil {
-			dbTx.Rollback()
-			return fmt.Errorf("failed to process transaction: %v", err)
+		// If RowsAffected is 0, it means the block already exists, and we can stop this importer.
+		if result.RowsAffected == 0 {
+			return ErrBlockExists
 		}
-	}
 
-	// Commit the transaction
-	if err := dbTx.Commit().Error; err != nil {
-		return fmt.Errorf("failed to commit transaction: %v", err)
-	}
+		// Process each transaction in the block
+		for _, txData := range block.Tx {
+			err := bi.processTransaction(tx, txData, block.Height)
+			if err != nil {
+				return fmt.Errorf("failed to process transaction: %v", err)
+			}
+		}
 
-	return nil
+		return nil
+	})
+
+	return err
 }
 
 func extractAddresses(scriptPubkey *btcjson.ScriptPubKeyResult) []string {
@@ -220,9 +265,11 @@ func extractAddresses(scriptPubkey *btcjson.ScriptPubKeyResult) []string {
 }
 
 func (bi *BlockImporter) processTransaction(dbTx *gorm.DB, txData btcjson.TxRawResult, blockHeight int64) error {
-	addressesInTx := make(map[string]bool)
+	// A coinbase transaction has exactly one input, and the input's `Coinbase` field is not empty.
+	isCoinbase := len(txData.Vin) == 1 && txData.Vin[0].Coinbase != ""
 
-	isCoinbase := len(txData.Vin) > 0 && txData.Vin[0].Coinbase != ""
+	// Keep track of addresses seen in this transaction to avoid duplicate address_in_tx records
+	addressesInTx := make(map[string]bool)
 
 	txRecord := &db.Transaction{
 		BlockHeight: blockHeight,
@@ -254,105 +301,107 @@ func (bi *BlockImporter) processTransaction(dbTx *gorm.DB, txData btcjson.TxRawR
 
 	// Process inputs - create negative address transactions for spent outputs
 	for _, input := range txData.Vin {
-		// Skip coinbase inputs handled below in outputs
 		if isCoinbase {
 			continue
 		}
 
-		// We need to find the referenced transaction output information
-		// First check if we can find an existing address transaction for this output
+		var vouts []btcjson.Vout
+
+		// We need to find the referenced transaction output information.
+		// First, check our own database.
 		var referencedTx db.Transaction
 		result := dbTx.Where("txid = ?", input.Txid).First(&referencedTx)
 
 		if result.Error == nil {
-			// Process existing transaction in our database
-			var vouts []btcjson.Vout
+			// Transaction found in our database.
 			if err := json.Unmarshal(referencedTx.Vout, &vouts); err != nil {
-				log.Printf("Error unmarshaling vout data for tx %s: %v", input.Txid, err)
-				panic(err)
+				return fmt.Errorf("failed to unmarshal vout for tx %s from db: %w", input.Txid, err)
 			}
-
-			// Make sure the vout index is within range
-			if int(input.Vout) >= len(vouts) {
-				log.Printf("Vout index %d out of range for tx %s", input.Vout, input.Txid)
-				panic("vout index out of range")
+		} else if errors.Is(result.Error, gorm.ErrRecordNotFound) {
+			// Transaction not in DB, fetch from RPC. This is expected during backward sync.
+			txHash, err := chainhash.NewHashFromStr(input.Txid)
+			if err != nil {
+				return fmt.Errorf("failed to create hash from txid string '%s': %w", input.Txid, err)
 			}
-
-			// Get the output being spent
-			output := vouts[input.Vout]
-
-			// Extract the address(es) from the output
-			addresses := extractAddresses(&output.ScriptPubKey)
-
-			// Convert BTC to satoshis
-			amtSat := int64(output.Value * 100000000)
-
-			// Create negative address transaction records for each address
-			for _, addr := range addresses {
-				// Mark this address as seen in this transaction
-				if _, seen := addressesInTx[addr]; !seen {
-					addressesInTx[addr] = true
-				}
-
-				// Create negative address transaction record for the spend
-				addrTx := db.AddressTransaction{
-					ID:          uuid.New(),
-					Address:     addr,
-					TxID:        txData.Txid,
-					BlockHeight: blockHeight,
-					Amount:      -amtSat, // Negative for inputs/spends
-					Coinbase:    false,   // Input spends can never be coinbase
-					InputTxId:   &input.Txid,
-					InputVout:   func() *int { v := int(input.Vout); return &v }(),
-				}
-
-				if err := dbTx.Clauses(clause.OnConflict{DoNothing: true}).Create(&addrTx).Error; err != nil {
-					log.Printf("Error creating spend address transaction for %s: %v", addr, err)
-					panic(err)
-				}
+			refTxVerbose, err := bi.RPC.GetRawTransactionVerbose(txHash)
+			if err != nil {
+				// This can happen if the node is pruned and doesn't have the full tx history.
+				// We log a warning and skip this input, as we can't process it.
+				log.Printf("WARN: could not fetch referenced tx %s from RPC: %v. Skipping input.", input.Txid, err)
+				continue
 			}
+			vouts = refTxVerbose.Vout
 		} else {
-			panic(result.Error)
-		}
-	}
-
-	// Process outputs to create address_transactions
-	for _, output := range txData.Vout {
-		// Skip outputs with no value
-		if output.Value <= 0 {
-			continue
+			// A different database error occurred.
+			return fmt.Errorf("db error fetching referenced tx %s: %w", input.Txid, result.Error)
 		}
 
-		// Convert BTC to satoshis
+		// Ensure the vout index is valid.
+		if int(input.Vout) >= len(vouts) {
+			return fmt.Errorf("vout index %d out of range for tx %s (len=%d)", input.Vout, input.Txid, len(vouts))
+		}
+
+		// Get the specific output being spent.
+		output := vouts[input.Vout]
+
+		// Extract address(es) from the output's script.
+		addresses := extractAddresses(&output.ScriptPubKey)
 		amtSat := int64(output.Value * 100000000)
 
-		// Extract addresses from output
-		addresses := extractAddresses(&output.ScriptPubKey)
-
-		// If we found addresses, create the necessary records
+		// Create negative address transaction records for each address.
 		for _, addr := range addresses {
-			// Mark address as seen in this transaction
 			if _, seen := addressesInTx[addr]; !seen {
 				addressesInTx[addr] = true
 			}
-			// log.Printf("Address: %s, Amount: %d, Coinbase: %t", addr, amtSat, isCoinbase)
+
 			addrTx := db.AddressTransaction{
 				ID:          uuid.New(),
 				Address:     addr,
 				TxID:        txData.Txid,
 				BlockHeight: blockHeight,
-				Amount:      amtSat,     // Positive for outputs
-				Coinbase:    isCoinbase, // Mark if this is from a coinbase transaction
+				Amount:      -amtSat, // Negative for inputs/spends.
+				Coinbase:    false,
+				InputTxId:   &input.Txid,
+				InputVout:   func() *int { v := int(input.Vout); return &v }(),
+			}
+
+			if err := dbTx.Clauses(clause.OnConflict{DoNothing: true}).Create(&addrTx).Error; err != nil {
+				return fmt.Errorf("failed to create spend address transaction for %s: %w", addr, err)
+			}
+		}
+	}
+
+	// Process outputs to create address_transactions
+	for _, output := range txData.Vout {
+		if output.Value <= 0 {
+			continue
+		}
+
+		amtSat := int64(output.Value * 100000000)
+		addresses := extractAddresses(&output.ScriptPubKey)
+
+		for _, addr := range addresses {
+			if _, seen := addressesInTx[addr]; !seen {
+				addressesInTx[addr] = true
+			}
+			addrTx := db.AddressTransaction{
+				ID:          uuid.New(),
+				Address:     addr,
+				TxID:        txData.Txid,
+				BlockHeight: blockHeight,
+				Amount:      amtSat, // Positive for outputs.
+				Coinbase:    isCoinbase,
 				InputTxId:   nil,
 				InputVout:   nil,
 			}
 
 			if err := dbTx.Clauses(clause.OnConflict{DoNothing: true}).Create(&addrTx).Error; err != nil {
-				log.Printf("Error creating address transaction for %s: %v", addr, err)
-				panic(err)
+				return fmt.Errorf("failed to create address transaction for %s: %w", addr, err)
 			}
 		}
 	}
 
 	return nil
 }
+
+// ... (rest of the code remains the same)
